@@ -44,7 +44,7 @@ suspend fun SparkWallet.consolidateLeaves(maxLeavesPerRound: Int = 100): SparkLe
     // Un-freeze what we can first: renewal resets low refund timelocks so those
     // leaves can join the swap instead of being skipped. Best-effort — a failed
     // renewal just leaves that leaf in the skipped bucket.
-    runCatching { renewExhaustedLeaves() }
+    bestEffort { renewExhaustedLeaves() }
 
     var current = getLeaves()
     val leavesBefore = current.size

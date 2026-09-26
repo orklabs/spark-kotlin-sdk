@@ -1,5 +1,6 @@
 package gy.pig.spark
 
+import kotlinx.coroutines.CancellationException
 import spark.Spark
 import uniffi.spark_frost.constructNodeTxPair
 import uniffi.spark_frost.constructRefundTxTrio
@@ -22,13 +23,13 @@ private const val RENEWAL_INITIAL_SEQUENCE: UInt = 2000u
  * the next transfer, which would freeze the leaf and interfere with watchtowers
  * (matches JS doesTxnNeedRenewed).
  */
-private const val RENEWAL_THRESHOLD: UInt = 200u
+internal const val RENEWAL_THRESHOLD: UInt = 200u
 
 /**
- * Remaining refund-tx timelock in blocks. Below 200 the leaf needs renewal; at or
- * below 100 it cannot move at all until renewed.
+ * Remaining refund-tx timelock in blocks. Below 200 the leaf should be renewed; at or
+ * below 100 it cannot move; below 100 the coordinator will not renew it either (frozen).
  */
-val SparkLeaf.refundTimelockBlocks: UInt
+public val SparkLeaf.refundTimelockBlocks: UInt
     get() {
         // Missing or unparseable refund tx → 0 ("exhausted"): never spent, renewal attempted and
         // its failure reported per leaf instead of crashing the caller.
@@ -38,6 +39,24 @@ val SparkLeaf.refundTimelockBlocks: UInt
         } catch (_: SparkError) {
             0u
         }
+    }
+
+/**
+ * Whether the leaf can be transferred, paid or exited right now: its refund timelock is
+ * above the floor the coordinator enforces. Leaves in the renewable range just above the
+ * floor are still spendable; [getSpendableLeaves] renews them first.
+ */
+public val SparkLeaf.isSpendable: Boolean
+    get() = refundTimelockBlocks > SPARK_TIME_LOCK_INTERVAL.toUInt()
+
+/**
+ * Whether the coordinator will renew this leaf's timelocks (refund timelock in [100, 200)).
+ * A leaf below that range is frozen: only a unilateral exit can recover it.
+ */
+public val SparkLeaf.isRenewable: Boolean
+    get() {
+        val timelock = refundTimelockBlocks
+        return timelock >= SPARK_TIME_LOCK_INTERVAL.toUInt() && timelock < RENEWAL_THRESHOLD
     }
 
 /**
@@ -60,11 +79,17 @@ data class SparkLeafRenewal(
  *   "split node", resets node+refund to 2000)
  * - otherwise → renew_refund_timelock (decrements node by 100, resets refund to 2000)
  */
-suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal {
+public suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal {
     val leaves = getLeaves()
-    val needing = leaves.filter { it.refundTimelockBlocks < RENEWAL_THRESHOLD }
+    val (needing, stuck) = renewalCandidates(leaves)
+    // The coordinator refuses to renew a leaf whose refund timelock is already below one
+    // interval (100 blocks); report those without a round trip.
+    val failures = stuck.mapTo(mutableListOf()) {
+        "${it.id}: refund timelock ${it.refundTimelockBlocks} is below the coordinator's renewal minimum of " +
+            "$SPARK_TIME_LOCK_INTERVAL; only a unilateral exit can recover it"
+    }
     if (needing.isEmpty()) {
-        return SparkLeafRenewal(checked = leaves.size, renewed = 0, failures = emptyList())
+        return SparkLeafRenewal(checked = leaves.size, renewed = 0, failures = failures)
     }
 
     // Parents provide the prev-out context for the new node txs.
@@ -83,7 +108,6 @@ suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal {
     }
 
     var renewed = 0
-    val failures = mutableListOf<String>()
     for (leaf in needing) {
         val node = leaf.node
         if (node == null) {
@@ -93,11 +117,31 @@ suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal {
         try {
             renewLeaf(node, parents)
             renewed++
+        } catch (e: CancellationException) {
+            throw e
         } catch (t: Throwable) {
             failures.add("${leaf.id}: $t")
         }
     }
     return SparkLeafRenewal(checked = leaves.size, renewed = renewed, failures = failures)
+}
+
+/** Result of [renewalCandidates]. */
+internal data class RenewalCandidates(val renewable: List<SparkLeaf>, val stuck: List<SparkLeaf>)
+
+/**
+ * Split `AVAILABLE` leaves into those the coordinator will renew (refund timelock in
+ * [100, 200)) and those it will not (below 100), which only a unilateral exit can recover.
+ */
+internal fun renewalCandidates(leaves: List<SparkLeaf>): RenewalCandidates {
+    val renewable = mutableListOf<SparkLeaf>()
+    val stuck = mutableListOf<SparkLeaf>()
+    for (leaf in leaves) {
+        val timelock = leaf.refundTimelockBlocks
+        if (timelock >= RENEWAL_THRESHOLD) continue
+        if (timelock >= SPARK_TIME_LOCK_INTERVAL.toUInt()) renewable.add(leaf) else stuck.add(leaf)
+    }
+    return RenewalCandidates(renewable, stuck)
 }
 
 private suspend fun SparkWallet.renewLeaf(node: Spark.TreeNode, parents: Map<String, Spark.TreeNode>) {

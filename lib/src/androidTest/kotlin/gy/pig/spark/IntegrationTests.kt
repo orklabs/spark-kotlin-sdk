@@ -402,7 +402,7 @@ class IntegrationTests {
         val onchainAddress = "bc1qxaljgr87rlh6plxtjmxvkk9p45kk8dw743dg2s"
 
         val balanceBefore = walletA.getBalance()
-        val spendable = filterSpendableLeaves(balanceBefore.leaves)
+        val spendable = balanceBefore.leaves.filter { it.isSpendable }
         val spendableSats = spendable.sumOf { it.valueSats }
         println("=== WalletA balance before ===")
         println("  Total: ${balanceBefore.totalSats} sats (${balanceBefore.leaves.size} leaves)")

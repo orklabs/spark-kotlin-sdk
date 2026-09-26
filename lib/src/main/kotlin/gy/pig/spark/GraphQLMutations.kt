@@ -106,6 +106,7 @@ object GraphQLMutations {
                 request {
                     id
                     raw_connector_transaction
+                    raw_coop_exit_transaction
                     coop_exit_txid
                     status
                 }

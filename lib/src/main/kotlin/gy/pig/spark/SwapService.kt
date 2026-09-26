@@ -8,79 +8,58 @@ import uniffi.spark_frost.*
 import java.util.UUID
 
 /**
- * Select leaves that exactly cover the target amount, performing an SSP swap if needed.
+ * `AVAILABLE` leaves that can be sent right now.
+ *
+ * Leaves whose refund timelock is in the coordinator's renewable range are renewed first
+ * (best effort, as the reference SDK's leaf manager does before every spend). Leaves at the
+ * timelock floor are left out: the coordinator will neither move nor renew them, so including
+ * them would only make the whole operation fail. Their sats are reported as
+ * [SatsBalance.frozen]. Every spend path ([send], [payLightningInvoice], [withdraw],
+ * [withdrawAll], swaps) selects from this set, so it is also the right basis for an app's
+ * "send everything" amount.
+ */
+public suspend fun SparkWallet.getSpendableLeaves(): List<SparkLeaf> {
+    var leaves = getLeaves()
+    if (renewalCandidates(leaves).renewable.isNotEmpty()) {
+        bestEffort { renewExhaustedLeaves() }
+        leaves = getLeaves()
+    }
+    return movableLeaves(leaves)
+}
+
+/** Leaves whose refund timelock is above the floor and can therefore be transferred. */
+internal fun movableLeaves(leaves: List<SparkLeaf>): List<SparkLeaf> = leaves.filter { it.isSpendable }
+
+/**
+ * Select leaves that exactly cover the target amount. If no exact match exists, triggers a
+ * leaf swap via the SSP to split leaves into the required denominations.
  *
  * Critical: this NEVER overspends. Spark transfers spend the entire selected leaf set,
  * so picking more than `amountSats` would silently lose the difference.
- *
- * Strategy:
- * 1. Filter out spent-down leaves (rounded timelock <= SPARK_TIME_LOCK_INTERVAL) — their
- *    next-sequence math would underflow to zero, so they need to be refreshed via swap
- *    before they can be spent again.
- * 2. Try exact selection from spendable leaves.
- * 3. If no exact match, request an SSP leaves swap to split leaves into the right
- *    denominations, then retry exact selection.
- * 4. If still no exact match after swap → throw (never overspend).
  */
 suspend fun SparkWallet.selectLeavesWithSwap(amountSats: Long): List<SparkLeaf> {
-    val leaves = getLeaves()
-    val spendable = filterSpendableLeaves(leaves)
+    val leaves = getSpendableLeaves()
 
-    tryExactSelection(spendable, amountSats)?.let { return it }
+    // First try exact selection (leaves that sum exactly to the target)
+    tryExactSelection(leaves, amountSats)?.let { return it }
 
-    // No exact match — request a swap to split leaves into target denominations
+    // No exact match — swap leaves via SSP to get right denominations
     val newLeaves = requestLeavesSwap(targetAmounts = listOf(amountSats))
-    val spendableAfterSwap = filterSpendableLeaves(newLeaves)
 
-    return tryExactSelection(spendableAfterSwap, amountSats)
-        ?: throw SparkError.InvalidResponse(
-            "Failed to select leaves for target amount $amountSats after swap"
-        )
-}
-
-/**
- * Keep only leaves whose rounded-down timelock is strictly greater than one
- * [SPARK_TIME_LOCK_INTERVAL]. A leaf whose rounded timelock equals the interval is
- * spent-down: the next-sequence math (round down, subtract one interval) underflows
- * to zero and the server rejects the swap's CPFP refund. Such leaves must be
- * refreshed via an SSP swap before they can be spent again.
- */
-internal fun filterSpendableLeaves(leaves: List<SparkLeaf>): List<SparkLeaf> {
-    return leaves.filter { leaf ->
-        val node = leaf.node ?: return@filter false
-        val refundTx = node.refundTx.toByteArray()
-        if (refundTx.isEmpty()) return@filter false
-        val rawSeq = try {
-            parseSequenceFromRawTx(refundTx)
-        } catch (_: SparkError) {
-            return@filter false
-        }
-        val currentTimelock = rawSeq and 0xFFFFu
-        // The server rounds the timelock DOWN to a multiple of the interval, then
-        // subtracts one interval when building the swap's CPFP refund. If that
-        // reaches zero it rejects the tx (observed live: "current timelock 100 …
-        // too small to subtract TimeLockInterval 100 without reaching zero"). So a
-        // leaf is only spendable when its rounded-down timelock is STRICTLY greater
-        // than one interval. The previous `>=` kept dead timelock-100 leaves and
-        // made every swap / Lightning send that selected one fail.
-        val interval = SPARK_TIME_LOCK_INTERVAL.toUInt()
-        val roundedTimelock = currentTimelock - (currentTimelock % interval)
-        roundedTimelock > interval
-    }
+    // Retry selection with new leaves (must find exact match — never overspend)
+    return tryExactSelection(movableLeaves(newLeaves), amountSats)
+        ?: throw SparkError.InvalidResponse("Failed to select leaves for target amount $amountSats after swap")
 }
 
 /**
  * Request a leaf swap via SSP: splits existing leaves into target denominations.
  * Returns the wallet's leaves after the swap completes (with new claimed leaves).
- *
- * Only spendable leaves can be swapped — expired leaves (currentTimelock == 0) are
- * rejected by the server's CPFP validation, so they're filtered out here.
  */
 suspend fun SparkWallet.requestLeavesSwap(targetAmounts: List<Long>): List<SparkLeaf> {
     val totalTarget = targetAmounts.sum()
-    val leaves = filterSpendableLeaves(getLeaves())
+    val leaves = getSpendableLeaves()
 
-    // Select smallest-first leaves covering the total target
+    // Select leaves covering the total target (smallest first)
     val sorted = leaves.sortedBy { it.valueSats }
     val selected = mutableListOf<SparkLeaf>()
     var total = 0L

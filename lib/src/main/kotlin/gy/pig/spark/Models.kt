@@ -4,24 +4,32 @@ import java.math.BigInteger
 import java.util.Date
 
 /**
- * Three-way breakdown of the wallet's sat balance.
+ * Breakdown of the wallet's sat balance.
  *
  * Mirrors `SparkSDK/Models.SatsBalance` from the official Swift SDK so the
  * Kotlin and Swift surfaces compose into the same numbers when the same
  * wallet is queried from both platforms.
  *
- * - [available]: immediately spendable. Sum of leaf nodes whose protocol
- *   status is `AVAILABLE`.
- * - [owned]: [available] plus value locked in outgoing transfers/swaps
- *   (`TRANSFER_LOCKED`, `SPLIT_LOCKED`, `AGGREGATE_LOCK`, `RENEW_LOCKED`).
- *   Use this for "how much do I own right now" displays where in-flight
- *   sends should not appear to vanish.
+ * - [available]: sats that can be sent right now — `AVAILABLE` leaves whose
+ *   refund timelock is above the floor the coordinator enforces. Sending the
+ *   full [available] balance always succeeds.
+ * - [owned]: every sat the wallet owns: [available] plus [frozen] plus value
+ *   locked in outgoing transfers/swaps (`TRANSFER_LOCKED`, `SPLIT_LOCKED`,
+ *   `AGGREGATE_LOCK`, `RENEW_LOCKED`). Use this for "how much do I own right
+ *   now" displays where in-flight sends should not appear to vanish.
  * - [incoming]: pending inbound transfers that have not been claimed yet,
  *   plus on-chain deposits whose nodes are still in `CREATING` state.
  *   Add to [available] to mirror what most wallet UIs label "balance"
  *   while a payment is in flight.
+ * - [frozen]: sats in `AVAILABLE` leaves at the timelock floor. The
+ *   coordinator will neither move nor renew them; only a unilateral on-chain
+ *   exit can recover them.
+ * - [locked]: sats held by an in-flight transfer, swap, renewal or exit.
  */
-public data class SatsBalance(public val available: Long, public val owned: Long, public val incoming: Long,)
+public data class SatsBalance(public val available: Long, public val owned: Long, public val incoming: Long, public val frozen: Long,) {
+    /** Sats locked by an in-flight transfer, swap, renewal or exit (`owned - available - frozen`). */
+    public val locked: Long get() = maxOf(0L, owned - available - frozen)
+}
 
 public data class WalletBalance(public val satsBalance: SatsBalance, public val tokenBalances: List<TokenBalance>, public val leaves: List<SparkLeaf>,) {
     /**
@@ -69,6 +77,57 @@ data class StaticDepositAddress(val address: String, val verifyingKey: ByteArray
 data class LightningInvoice(val paymentRequest: String, val paymentHash: String, val amountSats: Long, val expiresAt: Date,)
 
 data class FeeQuote(val feeSats: Long, val feeRateSatsPerVbyte: Long,)
+
+/**
+ * What [withdrawAll] would do right now. Produced by [quoteWithdrawAll] after pending inbound
+ * transfers were claimed and renewable leaves renewed.
+ */
+public data class WithdrawAllQuote(
+    /** Sats that would be handed to the SSP: every spendable leaf. */
+    public val spendableSats: Long,
+    /** The SSP's fee quote (fast exit) for those leaves. Zero when there is nothing to send. */
+    public val quotedFeeSats: Long,
+    /** Sats in leaves at the timelock floor. They stay behind; only a unilateral exit moves them. */
+    public val frozenSats: Long,
+    /** Sats in leaves locked by an in-flight swap or exit. Withdraw again once they settle. */
+    public val lockedSats: Long,
+    /** Inbound sats that are still unclaimed after the claim attempt. */
+    public val incomingSats: Long,
+    /** Number of leaves that would be exited. */
+    public val leafCount: Int,
+) {
+    /** What the destination would receive if the SSP charges exactly its quote. */
+    public val estimatedPayoutSats: Long get() = spendableSats - quotedFeeSats
+
+    /** Share of the wallet's own sats (spendable + frozen) that cannot leave off-chain, 0...1. */
+    public val frozenFraction: Double
+        get() {
+            val total = spendableSats + frozenSats
+            return if (total > 0) frozenSats.toDouble() / total.toDouble() else 0.0
+        }
+
+    /** Whether the quoted fee leaves anything to pay out. */
+    public val coversFee: Boolean get() = spendableSats > quotedFeeSats && quotedFeeSats >= 0
+}
+
+/** Outcome of [withdrawAll]. */
+public data class WithdrawAllResult(
+    /** L1 transaction id of the cooperative exit. */
+    public val txid: String,
+    /** Sats handed to the SSP: every spendable sat at drain time. */
+    public val sentSats: Long,
+    /** Sats the verified exit transaction pays to the destination. */
+    public val payoutSats: Long,
+    /** Sats left in frozen leaves; only a unilateral exit can recover them. */
+    public val frozenSats: Long,
+    /** Sats left in leaves locked by an in-flight operation. */
+    public val lockedSats: Long,
+    /** Inbound sats that could not be claimed before the drain. */
+    public val unclaimedSats: Long,
+) {
+    /** SSP fee actually taken. */
+    public val feeSats: Long get() = sentSats - payoutSats
+}
 
 data class UnusedDepositAddress(val address: String, val leafId: String, val userSigningPublicKey: ByteArray, val verifyingPublicKey: ByteArray,) {
     override fun equals(other: Any?): Boolean {
