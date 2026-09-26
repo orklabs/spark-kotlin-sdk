@@ -197,7 +197,7 @@ class IntegrationTests {
         }
 
         val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "integration test")
-        val paymentID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest)
+        val paymentID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
         assertTrue(paymentID.isNotEmpty())
         println("Payment ID: $paymentID")
 
@@ -221,7 +221,7 @@ class IntegrationTests {
         }
 
         val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
-        val paymentID = walletA.payLightningInvoice(paymentRequest = bolt11)
+        val paymentID = walletA.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
         assertTrue(paymentID.isNotEmpty())
         println("External payment ID: $paymentID")
     }
@@ -727,6 +727,7 @@ class IntegrationTests {
 
         val paymentId = walletA.payLightningInvoice(
             paymentRequest = invoice.paymentRequest,
+            maxFeeSats = 50,
             idempotencyKey = idempotencyKey,
         )
         assertTrue(paymentId.isNotEmpty())
@@ -975,7 +976,7 @@ class IntegrationTests {
         val invoice = walletB.createLightningInvoice(amountSats = lnAmount, memo = "full flow test")
         assertEquals(lnAmount, invoice.amountSats)
 
-        val payID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest)
+        val payID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
         assertTrue(payID.isNotEmpty())
         println("  Payment sent: $payID")
 
@@ -1046,7 +1047,7 @@ class IntegrationTests {
         TestConfig.requireLnAddress()
         println("\n--- Phase 3: Lightning A -> ${TestConfig.lnAddress} (10 sats) ---")
         val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
-        val extPayID = walletA.payLightningInvoice(paymentRequest = bolt11)
+        val extPayID = walletA.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
         assertTrue(extPayID.isNotEmpty())
         println("  External payment: $extPayID")
 
