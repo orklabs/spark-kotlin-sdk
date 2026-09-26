@@ -33,6 +33,18 @@ class SparkAuthenticator {
         return result.token
     }
 
+    /**
+     * Forget this operator's cached session. Called by [AuthRetryInterceptor] when the operator
+     * answers UNAUTHENTICATED: a token the server no longer honours stays "valid" by its own
+     * `expiresAt` for hours, and replaying it would fail every call until the process restarts.
+     * Per operator and identity, like the official SDK's cache.
+     */
+    suspend fun invalidate(soAddress: String, signer: SparkSignerProtocol) {
+        mutex.withLock {
+            tokenCache.remove("$soAddress:${signer.identityPublicKey.toHexString()}")
+        }
+    }
+
     suspend fun getAuthMetadata(connectionManager: GrpcConnectionManager, soAddress: String, signer: SparkSignerProtocol,): Metadata {
         val token = getToken(connectionManager, soAddress, signer)
         val metadata = Metadata()

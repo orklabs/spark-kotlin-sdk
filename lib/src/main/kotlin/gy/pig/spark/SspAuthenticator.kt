@@ -27,6 +27,15 @@ class SspAuthenticator(private val httpClient: OkHttpClient, private val sspURL:
         return token.token
     }
 
+    /**
+     * Forget the cached session. [SspGraphQLClient] calls this when the SSP rejects the token
+     * before its `valid_until` (rotation, restart): the next [getToken] authenticates afresh
+     * instead of replaying the rejected one until the process restarts.
+     */
+    suspend fun invalidate() {
+        mutex.withLock { cachedToken = null }
+    }
+
     private suspend fun authenticate(): CachedToken {
         val identityPubKeyHex = signer.identityPublicKey.toHexString()
 

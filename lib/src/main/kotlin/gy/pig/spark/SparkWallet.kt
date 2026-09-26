@@ -4,8 +4,7 @@ import io.grpc.Metadata
 import io.grpc.stub.MetadataUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 import spark.SparkServiceGrpcKt
 import spark_token.SparkTokenServiceGrpcKt
@@ -16,8 +15,7 @@ import spark_token.SparkTokenServiceGrpcKt
  * A `SparkWallet` owns the gRPC channels to Spark operators, the GraphQL client to the
  * SSP, and a [SparkSignerProtocol] implementation that controls the wallet's identity
  * and FROST signing material. Construct one via [fromMnemonic], [fromAccountKey], or
- * [fromSigner], and always call [close] when you are done — it cancels the internal
- * coroutine scope and drains the gRPC channels.
+ * [fromSigner], and call [close] when you are done — it drains the gRPC channels.
  *
  * Typical lifecycle:
  *
@@ -48,11 +46,26 @@ import spark_token.SparkTokenServiceGrpcKt
  * @see SparkError
  */
 class SparkWallet private constructor(val config: SparkConfig, val signer: SparkSignerProtocol,) {
-    internal val connectionManager = GrpcConnectionManager(config.signingOperatorAddresses)
     internal val authenticator = SparkAuthenticator()
-    internal val sspClient: SspGraphQLClient
 
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    /**
+     * Runs the token refreshes of [AuthRetryInterceptor]. Never cancelled: [close] only drops
+     * the connections, and the wallet stays usable afterwards.
+     */
+    private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Every operator channel re-authenticates and replays a call once on UNAUTHENTICATED (the
+    // official SDK's auth middleware), so a token the server stopped honouring is replaced on the
+    // spot rather than replayed until the process restarts.
+    internal val connectionManager: GrpcConnectionManager = GrpcConnectionManager(config.signingOperatorAddresses) { address ->
+        listOf(
+            AuthRetryInterceptor(transportScope) {
+                authenticator.invalidate(address, signer)
+                authenticator.getToken(this.connectionManager, address, signer)
+            },
+        )
+    }
+    internal val sspClient: SspGraphQLClient
 
     /**
      * The wallet's identity public key as a lowercase hex string (33-byte compressed
@@ -76,9 +89,12 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
     init {
         val httpClient = OkHttpClient()
         val sspAuthenticator = SspAuthenticator(httpClient, config.sspURL, signer)
-        sspClient = SspGraphQLClient(httpClient, config.sspURL) {
-            sspAuthenticator.getToken()
-        }
+        sspClient = SspGraphQLClient(
+            httpClient = httpClient,
+            sspURL = config.sspURL,
+            getToken = { sspAuthenticator.getToken() },
+            invalidateToken = { sspAuthenticator.invalidate() },
+        )
     }
 
     companion object {
@@ -149,14 +165,14 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
     fun exportAccountKey(): ByteArray = (signer as SparkSigner).exportAccountKey()
 
     /**
-     * Shut down the wallet's gRPC channels and cancel the internal coroutine scope.
+     * Shut every operator connection down.
      *
-     * Safe to call more than once. Always pair construction with a `try / finally`
-     * (or a coroutine `use { }`-style helper) to avoid leaking gRPC connections.
+     * The wallet stays usable: the next call after `close()` builds fresh channels (that is how
+     * a host app cycles connections around backgrounding). Safe to call more than once. Always
+     * pair construction with a `try / finally` to avoid leaking gRPC connections.
      */
     suspend fun close() {
         connectionManager.close()
-        scope.cancel()
     }
 
     internal suspend fun getAuthMetadata(soAddress: String): Metadata = authenticator.getAuthMetadata(connectionManager, soAddress, signer)
