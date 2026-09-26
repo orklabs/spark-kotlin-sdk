@@ -15,14 +15,14 @@ import uniffi.spark_frost.getPublicKeyBytes
  */
 
 /** Fresh refund txs are minted with this timelock (matches JS INITIAL_TIMELOCK). */
-private val RENEWAL_INITIAL_SEQUENCE: UInt = 2000u
+private const val RENEWAL_INITIAL_SEQUENCE: UInt = 2000u
 
 /**
  * Renew when the refund timelock drops below this — prevents it going under 100 after
  * the next transfer, which would freeze the leaf and interfere with watchtowers
  * (matches JS doesTxnNeedRenewed).
  */
-private val RENEWAL_THRESHOLD: UInt = 200u
+private const val RENEWAL_THRESHOLD: UInt = 200u
 
 /**
  * Remaining refund-tx timelock in blocks. Below 200 the leaf needs renewal; at or
@@ -313,10 +313,7 @@ private class RenewalContext(node: Spark.TreeNode, signer: SparkSignerProtocol) 
 }
 
 /** Fetch one SO commitment per job (indexed by position) and FROST-sign. */
-private suspend fun SparkWallet.signRenewalJobs(
-    specs: List<SigningSpec>,
-    context: RenewalContext,
-): Map<String, Spark.UserSignedTxSigningJob> {
+private suspend fun SparkWallet.signRenewalJobs(specs: List<SigningSpec>, context: RenewalContext,): Map<String, Spark.UserSignedTxSigningJob> {
     val stub = getCoordinatorStub()
     val commitmentsRequest = Spark.GetSigningCommitmentsRequest.newBuilder()
         .addNodeIds(context.leafId)

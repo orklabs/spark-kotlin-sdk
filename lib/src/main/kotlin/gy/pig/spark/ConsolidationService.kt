@@ -1,3 +1,6 @@
+// Service files are named after the Swift SDK's services, not their single public type.
+@file:Suppress("MatchingDeclarationName")
+
 package gy.pig.spark
 
 /**
@@ -55,24 +58,24 @@ suspend fun SparkWallet.consolidateLeaves(maxLeavesPerRound: Int = 100): SparkLe
     }
 
     var rounds = 0
-    while (rounds < 12) {
+    var progressing = true
+    while (progressing && rounds < 12) {
         val movable = swappable(current)
         val ideal = binaryDecomposition(movable.sumOf { it.valueSats })
-        if (movable.size <= ideal.size) break
 
         // Merge the smallest leaves first — they are the ones that make exits
         // uneconomical and bundles huge.
         val batch = movable.sortedBy { it.valueSats }.take(maxLeavesPerRound)
         val batchTotal = batch.sumOf { it.valueSats }
         val targets = binaryDecomposition(batchTotal)
-        if (batch.size <= targets.size || batchTotal <= 0) break
+        if (movable.size <= ideal.size || batch.size <= targets.size || batchTotal <= 0) break
 
         processSwapBatch(leaves = batch, targetAmounts = targets)
         rounds++
 
         val refreshed = getLeaves()
-        if (refreshed.size >= current.size) break // no progress — stop
-        current = refreshed
+        progressing = refreshed.size < current.size // no progress — stop
+        if (progressing) current = refreshed
     }
 
     return SparkLeafConsolidation(

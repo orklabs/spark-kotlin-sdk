@@ -169,8 +169,7 @@ fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
 }
 
 /** Whether a leaf's refund timelock can still be decremented by one interval. */
-fun timelockCanDecrement(refundTxData: ByteArray): Boolean =
-    (parseSequenceFromRawTx(refundTxData) and 0xFFFFu) > SPARK_TIME_LOCK_INTERVAL.toUInt()
+fun timelockCanDecrement(refundTxData: ByteArray): Boolean = (parseSequenceFromRawTx(refundTxData) and 0xFFFFu) > SPARK_TIME_LOCK_INTERVAL.toUInt()
 
 /** Parse sequence (nSequence) from the first input of a raw transaction. */
 fun parseSequenceFromRawTx(rawTx: ByteArray): UInt {

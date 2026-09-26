@@ -42,6 +42,9 @@ fun resolveLightningAddress(address: String, amountSats: Long): String {
     return invoiceJson.getString("pr")
 }
 
+// One live-network suite mirroring the Swift SDK's IntegrationTests; splitting it would only
+// duplicate the wallet setup and funding checks.
+@Suppress("LargeClass")
 @RunWith(AndroidJUnit4::class)
 class IntegrationTests {
 

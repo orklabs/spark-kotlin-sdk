@@ -21,10 +21,7 @@ data class SparkRecoveryLeaf(
 )
 
 /** An ancestor node on the path from a leaf to its tree root. */
-data class SparkRecoveryNode(
-    val id: String,
-    val treeNodeHex: String,
-)
+data class SparkRecoveryNode(val id: String, val treeNodeHex: String,)
 
 /**
  * Everything besides the seed needed to unilaterally exit the wallet's funds while
@@ -119,14 +116,14 @@ internal fun missingParentIds(all: Map<String, Spark.TreeNode>): Set<String> {
  * intermediates) that no exit package will ever use, and keeping them bloats the
  * bundle severalfold. Throws if a needed chain has a hole.
  */
-internal fun buildRecoverySnapshot(
-    all: Map<String, Spark.TreeNode>,
-    identityPublicKey: ByteArray,
-    network: String,
-): SparkRecoverySnapshot {
+internal fun buildRecoverySnapshot(all: Map<String, Spark.TreeNode>, identityPublicKey: ByteArray, network: String,): SparkRecoverySnapshot {
     // Same set getBalance() counts as owned.
     val ownedStatuses = setOf(
-        "AVAILABLE", "TRANSFER_LOCKED", "SPLIT_LOCKED", "AGGREGATE_LOCK", "RENEW_LOCKED",
+        "AVAILABLE",
+        "TRANSFER_LOCKED",
+        "SPLIT_LOCKED",
+        "AGGREGATE_LOCK",
+        "RENEW_LOCKED",
     )
     val referencedAsParent = all.values
         .filter { it.hasParentNodeId() && it.parentNodeId.isNotEmpty() }
