@@ -20,7 +20,7 @@ fun encodeBech32mTokenIdentifier(rawIdentifier: ByteArray, network: SparkNetwork
         "Token identifier must be 32 bytes, got ${rawIdentifier.size}"
     }
     val hrp = TokenIdentifierPrefix.prefix(network)
-    val words = Bech32m.toWords(rawIdentifier)
+    val words = Bech32.toWords(rawIdentifier)
     return Bech32m.encode(hrp, words)
 }
 
@@ -37,7 +37,7 @@ fun decodeBech32mTokenIdentifier(bech32mIdentifier: Bech32mTokenIdentifier, netw
     val detectedNetwork = TokenIdentifierPrefix.network(hrp)
         ?: throw SparkError.InvalidResponse("Unknown token identifier prefix: '$hrp'")
 
-    val rawBytes = Bech32m.fromWords(data)
+    val rawBytes = Bech32.fromWords(data)
         ?: throw SparkError.InvalidResponse("Failed to decode token identifier words")
 
     require(rawBytes.size == 32) {

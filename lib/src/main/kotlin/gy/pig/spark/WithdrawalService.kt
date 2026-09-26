@@ -5,8 +5,6 @@ import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
 import spark.Spark
 import uniffi.spark_frost.*
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
 
 suspend fun SparkWallet.getWithdrawalFeeEstimate(onChainAddress: String, leafIds: List<String>,): FeeQuote {
@@ -77,11 +75,10 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
         ?: throw SparkError.InvalidResponse("Invalid coop exit response")
     val connectorTxHex = request.optString("raw_connector_transaction", "")
     val coopExitTxid = request.optString("coop_exit_txid", "")
-    if (connectorTxHex.isEmpty() || coopExitTxid.isEmpty()) {
-        throw SparkError.InvalidResponse("Missing connector tx or coop exit txid")
+    val connectorTxBytes = connectorTxHex.hexToBytesOrNull()
+    if (connectorTxBytes == null || connectorTxBytes.isEmpty() || coopExitTxid.isEmpty()) {
+        throw SparkError.InvalidResponse("Missing or malformed connector tx or coop exit txid")
     }
-
-    val connectorTxBytes = connectorTxHex.hexToByteArray()
     val connectorTxId = computeTxId(connectorTxBytes)
 
     // Step 2: Build LeafRefundTxSigningJobs with connector inputs
@@ -119,7 +116,7 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
         )
 
         // Add connector input to each refund tx
-        val connectorInput = makeConnectorInputBytes(connectorTxId, i.toUInt())
+        val connectorInput = RawTransaction.Input(previousTxid = connectorTxId, previousIndex = i.toUInt())
         val cpfpRefundWithConnector = addInputToRawTx(refundTrio.cpfpRefund.tx, connectorInput)
 
         var directRefundWithConnector: ByteArray? = null
@@ -198,7 +195,7 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
     }
 
     // Step 3: Call cooperative_exit_v2 with unsigned refund txs
-    val coopExitTxidBytes = coopExitTxid.hexToByteArray().reversedArray()
+    val coopExitTxidBytes = txidBytesFromDisplayHex(coopExitTxid)
 
     val transferRequest = Spark.StartTransferRequest.newBuilder()
         .setTransferId(transferID)
@@ -226,15 +223,15 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
         val leafData = leafDataList.firstOrNull { it.leafId == result.leafId }
             ?: throw SparkError.InvalidResponse("Signing result for unknown leaf ${result.leafId}")
 
-        val connectorPrevOut = parseTxOutput(connectorTxBytes, leafData.connectorOutputIndex)
+        val connectorPrevOut = parseTxOutput(connectorTxBytes, leafData.connectorOutputIndex.toUInt())
 
         // Sign CPFP refund
-        val cpfpNodeOutput = parseTxOutput(leafData.cpfpNodeTx, 0)
+        val cpfpNodeOutput = parseTxOutput(leafData.cpfpNodeTx, 0u)
         val cpfpSighash = computeMultiInputSighashUniffi(
             tx = leafData.cpfpRefundTx,
             inputIndex = 0u,
-            prevOutScripts = listOf(cpfpNodeOutput.second, connectorPrevOut.second),
-            prevOutValues = listOf(cpfpNodeOutput.first.toULong(), connectorPrevOut.first.toULong()),
+            prevOutScripts = listOf(cpfpNodeOutput.scriptPubKey, connectorPrevOut.scriptPubKey),
+            prevOutValues = listOf(cpfpNodeOutput.value, connectorPrevOut.value),
         )
 
         val cpfpAgg = signAndAggregateFrost(
@@ -256,12 +253,12 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
 
         // Sign direct refund (if exists)
         if (leafData.directRefundTx != null && leafData.directNodeTx != null && result.hasDirectRefundTxSigningResult()) {
-            val directNodeOutput = parseTxOutput(leafData.directNodeTx, 0)
+            val directNodeOutput = parseTxOutput(leafData.directNodeTx, 0u)
             val directSighash = computeMultiInputSighashUniffi(
                 tx = leafData.directRefundTx,
                 inputIndex = 0u,
-                prevOutScripts = listOf(directNodeOutput.second, connectorPrevOut.second),
-                prevOutValues = listOf(directNodeOutput.first.toULong(), connectorPrevOut.first.toULong()),
+                prevOutScripts = listOf(directNodeOutput.scriptPubKey, connectorPrevOut.scriptPubKey),
+                prevOutValues = listOf(directNodeOutput.value, connectorPrevOut.value),
             )
 
             val directAgg = signAndAggregateFrost(
@@ -286,8 +283,8 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
         val dcfpSighash = computeMultiInputSighashUniffi(
             tx = leafData.directFromCpfpRefundTx,
             inputIndex = 0u,
-            prevOutScripts = listOf(cpfpNodeOutput.second, connectorPrevOut.second),
-            prevOutValues = listOf(cpfpNodeOutput.first.toULong(), connectorPrevOut.first.toULong()),
+            prevOutScripts = listOf(cpfpNodeOutput.scriptPubKey, connectorPrevOut.scriptPubKey),
+            prevOutValues = listOf(cpfpNodeOutput.value, connectorPrevOut.value),
         )
 
         val dcfpAgg = signAndAggregateFrost(
@@ -396,158 +393,22 @@ private fun signAndAggregateFrost(
     )
 }
 
-// MARK: - Raw tx helpers
+// MARK: - Raw tx helpers (bounds-checked, see RawTransaction)
 
-/** Compute txid from raw tx (double SHA-256, internal byte order) */
-internal fun computeTxId(rawTx: ByteArray): ByteArray {
-    val stripped = stripWitness(rawTx)
-    val hash1 = sha256(stripped)
-    return sha256(hash1)
-}
+/** Transaction id in internal byte order (the form used in input prevouts). */
+internal fun computeTxId(rawTx: ByteArray): ByteArray = RawTransaction.parse(rawTx).txid
 
-/** Strip witness data from a segwit tx to get legacy serialization */
-internal fun stripWitness(rawTx: ByteArray): ByteArray {
-    var offset = 4 // skip version
-    val hasWitness = rawTx.size > 5 && rawTx[offset] == 0x00.toByte() && rawTx[offset + 1] == 0x01.toByte()
-    if (!hasWitness) return rawTx
+/** The output (script + value) of a raw transaction at [vout]. */
+internal fun parseTxOutput(rawTx: ByteArray, vout: UInt): RawTransaction.Output = RawTransaction.parse(rawTx).output(vout)
 
-    val result = java.io.ByteArrayOutputStream()
-    result.write(rawTx, 0, 4) // version
+/** Check if a node tx has zero timelock (sequence & 0xFFFF == 0). */
+internal fun isZeroTimelockNode(nodeTx: ByteArray): Boolean = (parseSequenceFromRawTx(nodeTx) and 0xFFFFu) == 0u
 
-    offset += 2 // skip marker + flag
-
-    val (inputCount, inputCountLen) = readVarInt(rawTx, offset)
-    val inputCountStart = offset
-    offset += inputCountLen
-
-    for (i in 0 until inputCount.toInt()) {
-        offset += 36
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt() + 4
-    }
-
-    val (outputCount, outputCountLen) = readVarInt(rawTx, offset)
-    offset += outputCountLen
-    for (i in 0 until outputCount.toInt()) {
-        offset += 8
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt()
-    }
-
-    val afterOutputs = offset
-
-    result.write(rawTx, inputCountStart, afterOutputs - inputCountStart)
-    result.write(rawTx, rawTx.size - 4, 4) // locktime
-
-    return result.toByteArray()
-}
-
-/** Check if a node tx has zero timelock (sequence == 0) */
-internal fun isZeroTimelockNode(nodeTx: ByteArray): Boolean {
-    val seq = parseSequenceFromRawTx(nodeTx)
-    return (seq and 0xFFFFu) == 0u
-}
-
-/** Create raw bytes for a connector input (txid + vout + empty scriptSig + sequence) */
-internal fun makeConnectorInputBytes(txId: ByteArray, vout: UInt): ByteArray {
-    val out = java.io.ByteArrayOutputStream()
-    out.write(txId) // already in internal byte order
-    out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(vout.toInt()).array())
-    out.write(0) // scriptSig length = 0
-    out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(-1).array()) // 0xFFFFFFFF
-    return out.toByteArray()
-}
-
-/** Add an input to a raw transaction (handles both segwit and legacy) */
-internal fun addInputToRawTx(rawTx: ByteArray, input: ByteArray): ByteArray {
-    var offset = 4 // skip version
-
-    val hasWitness = rawTx.size > 5 && rawTx[offset] == 0x00.toByte() && rawTx[offset + 1] == 0x01.toByte()
-    if (hasWitness) offset += 2
-
-    val (inputCount, inputCountLen) = readVarInt(rawTx, offset)
-    val inputCountOffset = offset
-    offset += inputCountLen
-
-    for (i in 0 until inputCount.toInt()) {
-        offset += 36
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt() + 4
-    }
-    val afterInputs = offset
-
-    val result = java.io.ByteArrayOutputStream()
-
-    if (hasWitness) {
-        result.write(rawTx, 0, 4)
-        result.write(byteArrayOf(0x00, 0x01))
-    } else {
-        result.write(rawTx, 0, 4)
-    }
-
-    // New input count
-    result.write(encodeVarInt(inputCount + 1))
-    // Existing inputs (skip old input count bytes)
-    result.write(rawTx, inputCountOffset + inputCountLen, afterInputs - inputCountOffset - inputCountLen)
-    // New connector input
-    result.write(input)
-
-    if (hasWitness) {
-        // Outputs section
-        var outOffset = afterInputs
-        val (outputCount, outputCountLen) = readVarInt(rawTx, outOffset)
-        outOffset += outputCountLen
-        for (i in 0 until outputCount.toInt()) {
-            outOffset += 8
-            val (scriptLen, scriptLenLen) = readVarInt(rawTx, outOffset)
-            outOffset += scriptLenLen + scriptLen.toInt()
-        }
-        val afterOutputs = outOffset
-
-        result.write(rawTx, afterInputs, afterOutputs - afterInputs)
-
-        // Existing witness data
-        for (i in 0 until inputCount.toInt()) {
-            val (witnessCount, witnessCountLen) = readVarInt(rawTx, outOffset)
-            val witnessStart = outOffset
-            outOffset += witnessCountLen
-            for (j in 0 until witnessCount.toInt()) {
-                val (itemLen, itemLenLen) = readVarInt(rawTx, outOffset)
-                outOffset += itemLenLen + itemLen.toInt()
-            }
-            result.write(rawTx, witnessStart, outOffset - witnessStart)
-        }
-        // Empty witness for new input
-        result.write(0x00)
-        // Locktime
-        result.write(rawTx, rawTx.size - 4, 4)
-    } else {
-        // Rest of tx (outputs + locktime)
-        result.write(rawTx, afterInputs, rawTx.size - afterInputs)
-    }
-
-    return result.toByteArray()
-}
-
-/** Encode an integer as a Bitcoin varint */
-internal fun encodeVarInt(value: Long): ByteArray = when {
-    value < 0xFD -> byteArrayOf(value.toByte())
-    value <= 0xFFFF -> {
-        val out = java.io.ByteArrayOutputStream()
-        out.write(0xFD)
-        out.write(ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(value.toShort()).array())
-        out.toByteArray()
-    }
-    value <= 0xFFFFFFFFL -> {
-        val out = java.io.ByteArrayOutputStream()
-        out.write(0xFE)
-        out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value.toInt()).array())
-        out.toByteArray()
-    }
-    else -> {
-        val out = java.io.ByteArrayOutputStream()
-        out.write(0xFF)
-        out.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array())
-        out.toByteArray()
-    }
+/**
+ * Append an input to a raw transaction, preserving its serialisation format. A witness
+ * transaction gets an empty witness stack for the new input.
+ */
+internal fun addInputToRawTx(rawTx: ByteArray, input: RawTransaction.Input): ByteArray {
+    val tx = RawTransaction.parse(rawTx, context = "refund tx")
+    return tx.copy(inputs = tx.inputs + input).serialized(includeWitness = true)
 }

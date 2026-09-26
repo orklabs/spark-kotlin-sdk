@@ -30,9 +30,14 @@ private const val RENEWAL_THRESHOLD: UInt = 200u
  */
 val SparkLeaf.refundTimelockBlocks: UInt
     get() {
+        // Missing or unparseable refund tx → 0 ("exhausted"): never spent, renewal attempted and
+        // its failure reported per leaf instead of crashing the caller.
         val refundTx = node?.refundTx?.toByteArray() ?: return 0u
-        if (refundTx.isEmpty()) return 0u
-        return parseSequenceFromRawTx(refundTx) and 0xFFFFu
+        return try {
+            parseSequenceFromRawTx(refundTx) and 0xFFFFu
+        } catch (_: SparkError) {
+            0u
+        }
     }
 
 /**
@@ -116,9 +121,9 @@ private suspend fun SparkWallet.renewLeaf(node: Spark.TreeNode, parents: Map<Str
 private suspend fun SparkWallet.renewRefundTimelock(node: Spark.TreeNode, parent: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
     val parentTx = parent.nodeTx.toByteArray()
-    val address = p2trAddress(
-        pkScript = parseTxOutput(parentTx, 0).second,
-        network = config.network.networkString,
+    val address = BitcoinAddress.p2trAddress(
+        scriptPubKey = parseTxOutput(parentTx, 0u).scriptPubKey,
+        network = config.network,
     )
 
     val nodeSequence = parseSequenceFromRawTx(node.nodeTx.toByteArray())
@@ -180,9 +185,9 @@ private suspend fun SparkWallet.renewRefundTimelock(node: Spark.TreeNode, parent
 private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
     val parentTx = parent.nodeTx.toByteArray()
-    val address = p2trAddress(
-        pkScript = parseTxOutput(parentTx, 0).second,
-        network = config.network.networkString,
+    val address = BitcoinAddress.p2trAddress(
+        scriptPubKey = parseTxOutput(parentTx, 0u).scriptPubKey,
+        network = config.network,
     )
 
     // Split node: spends the parent output with zero timelock.
@@ -195,9 +200,9 @@ private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: 
         feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
     )
     // New node: spends the split node output at the initial timelock.
-    val splitAddress = p2trAddress(
-        pkScript = parseTxOutput(splitPair.cpfp.tx, 0).second,
-        network = config.network.networkString,
+    val splitAddress = BitcoinAddress.p2trAddress(
+        scriptPubKey = parseTxOutput(splitPair.cpfp.tx, 0u).scriptPubKey,
+        network = config.network,
     )
     val nodePair = constructNodeTxPair(
         parentTx = splitPair.cpfp.tx,
@@ -253,9 +258,9 @@ private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: 
 private suspend fun SparkWallet.renewZeroTimelockNode(node: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
     val nodeTx = node.nodeTx.toByteArray()
-    val address = p2trAddress(
-        pkScript = parseTxOutput(nodeTx, 0).second,
-        network = config.network.networkString,
+    val address = BitcoinAddress.p2trAddress(
+        scriptPubKey = parseTxOutput(nodeTx, 0u).scriptPubKey,
+        network = config.network,
     )
 
     val nodePair = constructNodeTxPair(
@@ -347,23 +352,4 @@ private suspend fun SparkWallet.submitRenewal(request: Spark.RenewLeafRequest, l
     if (response.renewResultCase == Spark.RenewLeafResponse.RenewResultCase.RENEWRESULT_NOT_SET) {
         throw SparkError.InvalidResponse("renew_leaf returned no result for leaf $leafId")
     }
-}
-
-/** bech32m P2TR address for a `OP_1 <32-byte>` output script. */
-internal fun p2trAddress(pkScript: ByteArray, network: String): String {
-    if (pkScript.size != 34 || pkScript[0] != 0x51.toByte() || pkScript[1] != 0x20.toByte()) {
-        throw SparkError.InvalidResponse("Output script is not P2TR (${pkScript.toHexString()})")
-    }
-    val hrp = when (network) {
-        "mainnet" -> "bc"
-        "regtest" -> "bcrt"
-        else -> "tb"
-    }
-    val program = Bech32m.convertBits(
-        pkScript.drop(2).map { it.toInt() and 0xFF },
-        fromBits = 8,
-        toBits = 5,
-        pad = true,
-    ) ?: throw SparkError.InvalidResponse("Failed to encode P2TR program")
-    return Bech32m.encode(hrp, listOf(0x01) + program)
 }

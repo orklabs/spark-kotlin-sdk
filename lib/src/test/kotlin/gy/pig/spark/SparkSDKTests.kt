@@ -203,7 +203,7 @@ class SparkSDKTests {
         val (hrp, words) = Bech32m.decodeBech32m(address)
         assertEquals("spark", hrp)
 
-        val payload = Bech32m.fromWords(words)
+        val payload = Bech32.fromWords(words)
         assertNotNull(payload)
         payload!!
         assertEquals("field 1, wire type 2 tag", 10.toByte(), payload[0])

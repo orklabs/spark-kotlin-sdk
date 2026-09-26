@@ -25,7 +25,8 @@ suspend fun SparkWallet.transferTokens(
     }
 
     val selected = selectTokenOutputs(outputs, tokenAmount, strategy)
-    val receiverData = decodeSparkAddressPublicKey(receiverSparkAddress)
+    // Decode receiver's Spark address (must be for this network) to get their identity public key
+    val receiverData = SparkAddress.decode(receiverSparkAddress, config.network)
 
     val tx = buildTransferTokenTransaction(
         selectedOutputs = selected,
@@ -623,17 +624,4 @@ internal fun SparkWallet.collectOperatorIdentityPublicKeys(): List<ByteString> {
             }
         )
         .map { ByteString.copyFrom(it) }
-}
-
-internal fun decodeSparkAddressPublicKey(sparkAddress: String): ByteArray {
-    val (_, data) = Bech32m.decodeBech32m(sparkAddress)
-    val payload = Bech32m.fromWords(data)
-        ?: throw SparkError.InvalidResponse("Invalid Spark address encoding")
-    // Payload is protobuf: field 1 (tag=10), length, then pubkey bytes
-    require(payload.size >= 2 && payload[0] == 10.toByte()) {
-        "Invalid Spark address payload"
-    }
-    val keyLen = payload[1].toInt() and 0xFF
-    require(payload.size >= 2 + keyLen) { "Spark address payload too short" }
-    return payload.copyOfRange(2, 2 + keyLen)
 }

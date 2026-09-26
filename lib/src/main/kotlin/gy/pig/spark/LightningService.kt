@@ -369,7 +369,7 @@ fun decodeBolt11PaymentHash(invoice: String): Pair<ByteArray, Long?> {
         if (pos + dataLength > values.size) break
 
         if (fieldType == 1) { // payment hash (p)
-            paymentHash = Bech32m.convertBits(
+            paymentHash = Bech32.convertBits(
                 values.subList(pos, pos + dataLength),
                 fromBits = 5,
                 toBits = 8,

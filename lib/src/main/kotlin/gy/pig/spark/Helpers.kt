@@ -3,6 +3,8 @@
 package gy.pig.spark
 
 import android.util.Base64
+import kotlinx.coroutines.CancellationException
+import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import javax.crypto.Mac
@@ -18,6 +20,49 @@ fun String.hexToByteArray(): ByteArray {
 }
 
 fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
+
+/**
+ * Strict hex decoding: `null` for an odd length or any non-hex character (Swift's
+ * `Data(hexString:)`). Use it for bytes that come from a server or a caller; the lenient
+ * [hexToByteArray] silently maps invalid characters to garbage.
+ */
+internal fun String.hexToBytesOrNull(): ByteArray? {
+    val hex = if (startsWith("0x")) substring(2) else this
+    if (hex.length % 2 != 0) return null
+    val out = ByteArray(hex.length / 2)
+    for (i in out.indices) {
+        val hi = asciiHexDigit(hex[2 * i])
+        val lo = asciiHexDigit(hex[2 * i + 1])
+        if (hi < 0 || lo < 0) return null
+        out[i] = ((hi shl 4) or lo).toByte()
+    }
+    return out
+}
+
+private fun asciiHexDigit(c: Char): Int = when (c) {
+    in '0'..'9' -> c - '0'
+    in 'a'..'f' -> c - 'a' + 10
+    in 'A'..'F' -> c - 'A' + 10
+    else -> -1
+}
+
+/**
+ * The string at [key], or `null` when it is missing, JSON `null`, or not a string — Swift's
+ * `json[key] as? String`. (`JSONObject.optString` returns `"null"` for a JSON null.)
+ */
+internal fun JSONObject.stringOrNull(key: String): String? = opt(key) as? String
+
+/**
+ * Run a best-effort step (Swift's `try?`): any failure is swallowed and reported as `null`,
+ * except coroutine cancellation, which is always propagated.
+ */
+internal inline fun <T> bestEffort(block: () -> T): T? = try {
+    block()
+} catch (e: CancellationException) {
+    throw e
+} catch (_: Exception) {
+    null
+}
 
 fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
 
@@ -40,7 +85,10 @@ fun decodeBase64URL(string: String): ByteArray? = try {
 }
 
 /** Parse ISO 8601 date strings with various fractional second formats and timezone offsets. */
-fun parseISODate(dateStr: String): java.util.Date = try {
+fun parseISODate(dateStr: String): java.util.Date = parseISODateOrNull(dateStr) ?: java.util.Date(System.currentTimeMillis() + 3600_000)
+
+/** [parseISODate] without the "one hour from now" fallback: `null` when the string does not parse. */
+internal fun parseISODateOrNull(dateStr: String): java.util.Date? = try {
     // Truncate fractional seconds to 3 digits (millis) and normalize timezone
     val normalized = dateStr
         .replace(Regex("(\\.\\d{3})\\d*"), "$1") // truncate micros to millis
@@ -50,9 +98,9 @@ fun parseISODate(dateStr: String): java.util.Date = try {
     formatter.timeZone = java.util.TimeZone.getTimeZone("UTC")
     // Z needs special handling for SimpleDateFormat
     val forParsing = normalized.replace("Z", "+0000")
-    formatter.parse(forParsing) ?: java.util.Date(System.currentTimeMillis() + 3600_000)
+    formatter.parse(forParsing)
 } catch (_: Exception) {
-    java.util.Date(System.currentTimeMillis() + 3600_000)
+    null
 }
 
 // MARK: - BIP-340 Tagged Hash

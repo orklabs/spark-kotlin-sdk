@@ -50,7 +50,11 @@ internal fun filterSpendableLeaves(leaves: List<SparkLeaf>): List<SparkLeaf> {
         val node = leaf.node ?: return@filter false
         val refundTx = node.refundTx.toByteArray()
         if (refundTx.isEmpty()) return@filter false
-        val rawSeq = parseSequenceFromRawTx(refundTx)
+        val rawSeq = try {
+            parseSequenceFromRawTx(refundTx)
+        } catch (_: SparkError) {
+            return@filter false
+        }
         val currentTimelock = rawSeq and 0xFFFFu
         // The server rounds the timelock DOWN to a multiple of the interval, then
         // subtracts one interval when building the swap's CPFP refund. If that

@@ -107,11 +107,7 @@ suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: U
     payload.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(outputIndex.toInt()).array())
     payload.write(0) // requestType = Fixed
     payload.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(feeEstimate.creditAmountSats).array())
-    val sigBytes = try {
-        feeEstimate.quoteSignature.hexToByteArray()
-    } catch (_: Exception) {
-        feeEstimate.quoteSignature.toByteArray(Charsets.UTF_8)
-    }
+    val sigBytes = feeEstimate.quoteSignature.hexToBytesOrNull() ?: feeEstimate.quoteSignature.toByteArray(Charsets.UTF_8)
     payload.write(sigBytes)
 
     val payloadHash = sha256(payload.toByteArray())
@@ -178,8 +174,8 @@ suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxF
     val quote = getDepositFeeEstimate(transactionId, outputIndex)
 
     val rawTx = fetchRawTransaction(transactionId)
-    val output = parseTxOutput(rawTx, outputIndex.toInt())
-    val totalAmount = output.first
+    val output = parseTxOutput(rawTx, outputIndex)
+    val totalAmount = output.value.toLong()
     val fee = totalAmount - quote.creditAmountSats
 
     if (fee > maxFee) return null
@@ -264,7 +260,7 @@ suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt = 0u) {
     )
 
     // txid reversed for protobuf
-    val txidBytes = txID.hexToByteArray().reversedArray()
+    val txidBytes = txidBytesFromDisplayHex(txID)
 
     val utxo = Spark.UTXO.newBuilder()
         .setRawTx(ByteString.copyFrom(rawTx))
@@ -295,8 +291,8 @@ suspend fun SparkWallet.refundStaticDeposit(depositTransactionId: String, output
 
     // Fetch deposit tx to know the output value
     val rawDepositTx = fetchRawTransaction(depositTransactionId)
-    val depositOutput = parseTxOutput(rawDepositTx, outputIndex.toInt())
-    val creditAmountSats = depositOutput.first - fee
+    val depositOutput = parseTxOutput(rawDepositTx, outputIndex)
+    val creditAmountSats = depositOutput.value.toLong() - fee
     require(creditAmountSats > 0) { "Fee too large, credit amount must be > 0" }
 
     // Build spend tx
@@ -305,15 +301,15 @@ suspend fun SparkWallet.refundStaticDeposit(depositTransactionId: String, output
         outputIndex = outputIndex,
         destinationAddress = destinationAddress,
         amountSats = creditAmountSats.toULong(),
-        network = config.network.networkString,
+        network = config.network,
     )
 
     // Compute sighash
     val sighash = computeMultiInputSighashUniffi(
         tx = spendTx,
         inputIndex = 0u,
-        prevOutScripts = listOf(depositOutput.second),
-        prevOutValues = listOf(depositOutput.first.toULong()),
+        prevOutScripts = listOf(depositOutput.scriptPubKey),
+        prevOutValues = listOf(depositOutput.value),
     )
 
     val staticKey = signer.deriveStaticDepositKey(0)
@@ -343,7 +339,7 @@ suspend fun SparkWallet.refundStaticDeposit(depositTransactionId: String, output
         bindingNonce = nonceResult.commitment.binding,
     )
 
-    val txidBytes = depositTransactionId.hexToByteArray().reversedArray()
+    val txidBytes = txidBytesFromDisplayHex(depositTransactionId)
     val utxo = Spark.UTXO.newBuilder()
         .setTxid(ByteString.copyFrom(txidBytes))
         .setVout(outputIndex.toInt())
@@ -452,128 +448,35 @@ internal suspend fun SparkWallet.fetchRawTransaction(txID: String): ByteArray {
 
     val hexString = response.body?.string()?.trim()
         ?: throw SparkError.InvalidResponse("Empty response for transaction $txID")
-    return hexString.hexToByteArray()
+    return hexString.hexToBytesOrNull() ?: throw SparkError.InvalidResponse("Invalid hex in raw transaction response")
 }
 
-/** Parse output value and scriptPubKey from a raw tx at given vout. */
-internal fun parseTxOutput(rawTx: ByteArray, vout: Int): Pair<Long, ByteArray> {
-    var offset = 4 // skip version
-    if (rawTx.size > 5 && rawTx[offset] == 0x00.toByte() && rawTx[offset + 1] == 0x01.toByte()) {
-        offset += 2 // skip witness marker+flag
-    }
-
-    // Skip inputs
-    val (inputCount, inputCountLen) = readVarInt(rawTx, offset)
-    offset += inputCountLen
-    for (i in 0 until inputCount.toInt()) {
-        offset += 36
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt() + 4
-    }
-
-    // Read outputs
-    val (outputCount, outputCountLen) = readVarInt(rawTx, offset)
-    offset += outputCountLen
-    for (i in 0 until outputCount.toInt()) {
-        // value (8 bytes LE)
-        var value = 0L
-        for (j in 0 until 8) value = value or ((rawTx[offset + j].toLong() and 0xFF) shl (j * 8))
-        offset += 8
-
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen
-        val script = rawTx.copyOfRange(offset, offset + scriptLen.toInt())
-        offset += scriptLen.toInt()
-
-        if (i == vout) return value to script
-    }
-    throw SparkError.InvalidResponse("Output index $vout not found in transaction")
+/** Parse a display-order (big-endian hex) txid into the internal byte order used on the wire. */
+internal fun txidBytesFromDisplayHex(hex: String): ByteArray {
+    val bytes = if (hex.length == 64) hex.hexToBytesOrNull() else null
+    return bytes?.reversedArray() ?: throw SparkError.InvalidResponse("Invalid transaction id: $hex")
 }
 
-/** Build a simple 1-input 1-output spend transaction. */
-internal fun constructSpendTx(depositTxId: String, outputIndex: UInt, destinationAddress: String, amountSats: ULong, network: String,): ByteArray {
-    val buf = java.io.ByteArrayOutputStream()
-
-    // Version 3 (LE)
-    buf.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(3).array())
-    // Segwit marker + flag
-    buf.write(byteArrayOf(0x00, 0x01))
-    // 1 input
-    buf.write(1)
-    // txid reversed + vout + empty scriptSig + sequence
-    buf.write(depositTxId.hexToByteArray().reversedArray())
-    buf.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(outputIndex.toInt()).array())
-    buf.write(0) // scriptSig length = 0
-    buf.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(-1).array()) // 0xFFFFFFFF
-
-    // 1 output
-    buf.write(1)
-    buf.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(amountSats.toLong()).array())
-
-    val scriptPubKey = decodeAddressToScript(destinationAddress, network)
-    buf.write(scriptPubKey.size)
-    buf.write(scriptPubKey)
-
-    // Witness placeholder
-    buf.write(0)
-    // Locktime
-    buf.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0).array())
-
-    return buf.toByteArray()
+/**
+ * Build a simple 1-input 1-output spend transaction (version 3, witness serialisation with an
+ * empty witness; the signature is attached by [addWitnessToTx]).
+ */
+internal fun constructSpendTx(depositTxId: String, outputIndex: UInt, destinationAddress: String, amountSats: ULong, network: SparkNetwork,): ByteArray {
+    val scriptPubKey = BitcoinAddress.scriptPubKey(destinationAddress, network)
+    val tx = RawTransaction(
+        version = 3u,
+        inputs = listOf(RawTransaction.Input(previousTxid = txidBytesFromDisplayHex(depositTxId), previousIndex = outputIndex)),
+        outputs = listOf(RawTransaction.Output(value = amountSats, scriptPubKey = scriptPubKey)),
+        locktime = 0u,
+        hasWitnessSerialization = true,
+    )
+    return tx.serialized(includeWitness = true)
 }
 
-internal fun decodeAddressToScript(address: String, network: String): ByteArray {
-    val (witnessVersion, programData) = Bech32m.decode(address)
-    val script = java.io.ByteArrayOutputStream()
-    if (witnessVersion == 0) {
-        script.write(0x00) // OP_0
-    } else {
-        script.write(0x50 + witnessVersion) // OP_1..OP_16
-    }
-    script.write(programData.size)
-    script.write(programData)
-    return script.toByteArray()
-}
-
+/** Attach a single-item witness (a schnorr signature) to the first input of a segwit tx. */
 internal fun addWitnessToTx(rawTx: ByteArray, witness: ByteArray): ByteArray {
-    var offset = 4
-    val hasWitness = rawTx.size > 5 && rawTx[offset] == 0x00.toByte() && rawTx[offset + 1] == 0x01.toByte()
-    if (hasWitness) offset += 2
-
-    // Skip inputs
-    val (inputCount, inputCountLen) = readVarInt(rawTx, offset)
-    offset += inputCountLen
-    for (i in 0 until inputCount.toInt()) {
-        offset += 36
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt() + 4
-    }
-
-    // Skip outputs
-    val (outputCount, outputCountLen) = readVarInt(rawTx, offset)
-    offset += outputCountLen
-    for (i in 0 until outputCount.toInt()) {
-        offset += 8
-        val (scriptLen, scriptLenLen) = readVarInt(rawTx, offset)
-        offset += scriptLenLen + scriptLen.toInt()
-    }
-
-    val result = java.io.ByteArrayOutputStream()
-    // version + marker + flag
-    result.write(rawTx, 0, 4)
-    result.write(byteArrayOf(0x00, 0x01))
-
-    // inputs + outputs
-    val inputOutputStart = if (hasWitness) 6 else 4
-    result.write(rawTx, inputOutputStart, offset - inputOutputStart)
-
-    // Witness: 1 item (schnorr signature)
-    result.write(1)
-    result.write(witness.size)
-    result.write(witness)
-
-    // Locktime (last 4 bytes)
-    result.write(rawTx, rawTx.size - 4, 4)
-
-    return result.toByteArray()
+    val tx = RawTransaction.parse(rawTx, context = "spend tx")
+    val first = tx.inputs.firstOrNull() ?: throw SparkError.MalformedTransaction("spend tx has no inputs")
+    val inputs = listOf(first.copy(witness = listOf(witness))) + tx.inputs.drop(1)
+    return tx.copy(inputs = inputs, hasWitnessSerialization = true).serialized(includeWitness = true)
 }

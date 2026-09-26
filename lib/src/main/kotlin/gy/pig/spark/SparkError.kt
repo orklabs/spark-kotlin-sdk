@@ -10,11 +10,14 @@ package gy.pig.spark
  *
  * ```kotlin
  * try {
- *     wallet.send(receiverIdentityPublicKey = pub, amountSats = 500)
+ *     wallet.send(receiverSparkAddress = "spark1...", amountSats = 500)
  * } catch (e: SparkError) {
  *     when (e) {
  *         is SparkError.InsufficientBalance -> ui.showLowBalance(e.need, e.have)
  *         is SparkError.AuthenticationFailed -> auth.reLogin()
+ *         is SparkError.FeeExceedsLimit -> ui.showFeeTooHigh(e.feeSats, e.maxFeeSats)
+ *         is SparkError.UntrustedResponse -> ui.showServiceProblem() // nothing was signed
+ *         is SparkError.LightningSendIncomplete -> retryLater(e.transferId)
  *         is SparkError.GrpcError,
  *         is SparkError.GraphqlError,
  *         is SparkError.FrostSigningFailed -> ui.showTransientFailure()
@@ -61,4 +64,34 @@ sealed class SparkError(override val message: String) : Exception(message) {
     /** The wallet doesn't have enough of the given token to cover the transfer. */
     data class InsufficientTokenBalance(val token: String, val need: String, val have: String) :
         SparkError("Insufficient token balance for $token: need $need, have $have")
+
+    /** A caller-supplied argument is invalid (non-positive amount, bad key, ...). */
+    data class InvalidArgument(val msg: String) : SparkError("Invalid argument: $msg")
+
+    /** Transaction bytes from an operator, the SSP, or a block explorer could not be parsed. */
+    data class MalformedTransaction(val msg: String) : SparkError("Malformed transaction: $msg")
+
+    /** A Bitcoin or Spark address is malformed or belongs to another network. */
+    data class InvalidAddress(val msg: String) : SparkError("Invalid address: $msg")
+
+    /** A BOLT-11 invoice is malformed or belongs to another network. */
+    data class InvalidInvoice(val msg: String) : SparkError("Invalid invoice: $msg")
+
+    /** A BIP-39 mnemonic failed wordlist or checksum validation. */
+    data class InvalidMnemonic(val msg: String) : SparkError("Invalid mnemonic: $msg")
+
+    /** A response from the SSP or a coordinator failed client-side validation. Nothing was signed. */
+    data class UntrustedResponse(val msg: String) : SparkError("Response failed validation: $msg")
+
+    /** A quoted fee exceeds the limit the caller allowed. */
+    data class FeeExceedsLimit(val feeSats: Long, val maxFeeSats: Long) :
+        SparkError("Quoted fee of $feeSats sats exceeds the allowed maximum of $maxFeeSats sats")
+
+    /**
+     * The coordinator locked leaves for a lightning payment but the SSP request failed.
+     * Retry `payLightningInvoice` with the same [transferId] to resume, or reconcile via
+     * `getTransferFromSsp`.
+     */
+    data class LightningSendIncomplete(val transferId: String, val reason: String) :
+        SparkError("Lightning send incomplete for transfer $transferId: $reason")
 }

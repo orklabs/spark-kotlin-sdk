@@ -24,11 +24,11 @@ class ConsolidationServiceTests {
     fun p2trAddressMatchesBip86ReferenceVector() {
         // BIP-86 first receive address: output key -> bc1p5cyxnux...
         val script = "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c".hexToByteArray()
-        val address = p2trAddress(pkScript = script, network = "mainnet")
+        val address = BitcoinAddress.p2trAddress(scriptPubKey = script, network = SparkNetwork.MAINNET)
         assertEquals("bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr", address)
 
         try {
-            p2trAddress(pkScript = byteArrayOf(0x00, 0x14), network = "mainnet")
+            BitcoinAddress.p2trAddress(scriptPubKey = byteArrayOf(0x00, 0x14), network = SparkNetwork.MAINNET)
             throw AssertionError("Expected SparkError for non-P2TR script")
         } catch (_: SparkError.InvalidResponse) {
         }
@@ -37,19 +37,16 @@ class ConsolidationServiceTests {
     // ── Timelock floor guard ────────────────────────────────────────────────
 
     /**
-     * Minimal legacy raw tx with one input whose nSequence is [sequence]:
-     * version(4) + inputCount(1) + outpoint(36) + scriptLen(0) + nSequence(4 LE).
+     * Minimal legacy raw tx with one input whose nSequence is [sequence] and no outputs. It has
+     * to be a complete transaction: the bounds-checked parser rejects truncated bytes.
      */
-    private fun rawTxWithSequence(sequence: UInt): ByteArray {
-        val tx = ByteArray(4 + 1 + 36 + 1 + 4)
-        tx[4] = 0x01
-        var seq = sequence
-        for (i in 0 until 4) {
-            tx[4 + 1 + 36 + 1 + i] = (seq and 0xFFu).toByte()
-            seq = seq shr 8
-        }
-        return tx
-    }
+    private fun rawTxWithSequence(sequence: UInt): ByteArray = RawTransaction(
+        version = 0u,
+        inputs = listOf(RawTransaction.Input(previousTxid = ByteArray(32), previousIndex = 0u, sequence = sequence)),
+        outputs = emptyList(),
+        locktime = 0u,
+        hasWitnessSerialization = false,
+    ).serialized(includeWitness = false)
 
     @Test
     fun computeNextSequencesDecrementsAboveFloor() {

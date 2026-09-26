@@ -155,77 +155,38 @@ fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
     val rawSequence = parseSequenceFromRawTx(refundTxData)
     val currentTimelock = rawSequence and 0xFFFFu
     val bit30 = rawSequence and (1u shl 30)
-    // At or below one interval the decrement reaches zero, which operators reject —
-    // and UInt subtraction would silently wrap to a garbage sequence instead of
-    // failing. The leaf is frozen until renew_leaf resets its refund timelock.
+    // A leaf at the timelock floor cannot be moved again until it is renewed by the
+    // operators, and UInt subtraction would silently wrap to a garbage sequence instead of
+    // failing. Strictly greater: the coordinator rejects a decrement that reaches zero
+    // ("too small to subtract TimeLockInterval without reaching zero").
     if (currentTimelock <= SPARK_TIME_LOCK_INTERVAL.toUInt()) {
         throw SparkError.LeafTimelockExhausted(
             "Leaf timelock exhausted ($currentTimelock <= $SPARK_TIME_LOCK_INTERVAL); needs renewal before it can move"
         )
     }
-    val nextTimelock = (currentTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt()) and 0xFFFFu
-    val directTimelock = (nextTimelock + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt()) and 0xFFFFu
-    return (bit30 or nextTimelock) to (bit30 or directTimelock)
+    val nextTimelock = currentTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt()
+    return (bit30 or nextTimelock) to (bit30 or (nextTimelock + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt()))
 }
 
-/** Whether a leaf's refund timelock can still be decremented by one interval. */
-fun timelockCanDecrement(refundTxData: ByteArray): Boolean = (parseSequenceFromRawTx(refundTxData) and 0xFFFFu) > SPARK_TIME_LOCK_INTERVAL.toUInt()
-
-/** Parse sequence (nSequence) from the first input of a raw transaction. */
-fun parseSequenceFromRawTx(rawTx: ByteArray): UInt {
-    if (rawTx.size < 10) return 0u
-    var offset = 4 // skip version
-
-    // Check for segwit marker
-    if (rawTx[offset] == 0x00.toByte()) {
-        offset += 2 // skip marker + flag
+/**
+ * Whether the leaf's refund timelock still has room to decrement — i.e. the leaf can be
+ * transferred/swapped without operator renewal. Strictly greater: the coordinator rejects
+ * decrements that reach zero.
+ */
+fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
+    // An unparseable refund tx is treated as exhausted: the leaf is skipped rather than
+    // crashing the caller or being handed to the coordinator with a bogus sequence.
+    val sequence = try {
+        parseSequenceFromRawTx(refundTxData)
+    } catch (_: SparkError) {
+        return false
     }
-
-    // Read input count (varint)
-    val (_, varIntSize) = readVarInt(rawTx, offset)
-    offset += varIntSize
-
-    // Skip previous outpoint (32 bytes txid + 4 bytes vout)
-    offset += 36
-
-    // Read script length (varint) and skip script
-    val (scriptLen, scriptVarIntSize) = readVarInt(rawTx, offset)
-    offset += scriptVarIntSize + scriptLen.toInt()
-
-    // Read sequence (4 bytes, little-endian)
-    if (offset + 4 > rawTx.size) return 0u
-    return ((rawTx[offset].toInt() and 0xFF).toUInt()) or
-        ((rawTx[offset + 1].toInt() and 0xFF).toUInt() shl 8) or
-        ((rawTx[offset + 2].toInt() and 0xFF).toUInt() shl 16) or
-        ((rawTx[offset + 3].toInt() and 0xFF).toUInt() shl 24)
+    return (sequence and 0xFFFFu) > SPARK_TIME_LOCK_INTERVAL.toUInt()
 }
 
-internal fun readVarInt(data: ByteArray, offset: Int): Pair<Long, Int> {
-    val first = data[offset].toInt() and 0xFF
-    return when {
-        first < 0xFD -> first.toLong() to 1
-        first == 0xFD -> {
-            val v = (
-                (data[offset + 1].toInt() and 0xFF) or
-                    ((data[offset + 2].toInt() and 0xFF) shl 8)
-                ).toLong()
-            v to 3
-        }
-        first == 0xFE -> {
-            val v = (
-                (data[offset + 1].toInt() and 0xFF) or
-                    ((data[offset + 2].toInt() and 0xFF) shl 8) or
-                    ((data[offset + 3].toInt() and 0xFF) shl 16) or
-                    ((data[offset + 4].toInt() and 0xFF) shl 24)
-                ).toLong()
-            v to 5
-        }
-        else -> {
-            var v = 0L
-            for (i in 1..8) {
-                v = v or ((data[offset + i].toLong() and 0xFF) shl ((i - 1) * 8))
-            }
-            v to 9
-        }
-    }
-}
+/**
+ * nSequence of the first input of a raw Bitcoin transaction (where Spark keeps leaf timelocks).
+ *
+ * @throws SparkError.MalformedTransaction when the bytes are not a well-formed transaction.
+ */
+fun parseSequenceFromRawTx(rawTx: ByteArray): UInt = RawTransaction.parse(rawTx, context = "leaf tx").firstInputSequence
