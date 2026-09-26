@@ -132,6 +132,9 @@ internal suspend fun SparkWallet.processSwapBatch(leaves: List<SparkLeaf>, targe
         .build()
     val commitmentsResponse = stub.getSigningCommitments(commitmentsRequest)
     val allCommitments = commitmentsResponse.signingCommitmentsList
+    if (allCommitments.size < leaves.size) {
+        throw SparkError.InvalidResponse("Got ${allCommitments.size} signing commitments, need ${leaves.size}")
+    }
 
     val cpfpRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
     val leafSigningInfos = mutableListOf<LeafSigningInfo>()
@@ -210,6 +213,7 @@ internal suspend fun SparkWallet.processSwapBatch(leaves: List<SparkLeaf>, targe
         signer = signer,
         soOperators = soOperators,
         signingOperatorConfigs = config.signingOperators,
+        threshold = config.signingThreshold,
     )
 
     val transferPackageBuilder = Spark.TransferPackage.newBuilder()

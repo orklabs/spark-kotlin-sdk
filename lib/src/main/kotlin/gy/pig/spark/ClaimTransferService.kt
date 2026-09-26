@@ -27,14 +27,22 @@ suspend fun SparkWallet.claimAllPendingTransfers(): Int {
     return claimed
 }
 
+/**
+ * Claim a single pending transfer using the single-call `claim_transfer` with a ClaimPackage.
+ * The sender's signature on every leaf is verified first; a transfer that fails verification
+ * is refused with [SparkError.UntrustedResponse] before any secret is decrypted or any refund
+ * is signed.
+ */
 suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
+    TransferLeafVerifier.verify(transfer, receiverIdentityPublicKey = signer.identityPublicKey)
+
     val stub = getCoordinatorStub()
     val networkStr = config.network.networkString
 
     val soListResponse = stub.getSigningOperatorList(Empty.getDefaultInstance())
-    val soOperators = soListResponse.signingOperatorsMap
-    val soCount = soOperators.size.toUInt()
-    val threshold = maxOf(2u, (soCount + 2u) / 2u)
+    val targets = KeyTweakHelper.matchOperators(server = soListResponse.signingOperatorsMap, config = config.signingOperators)
+    val soCount = targets.size.toUInt()
+    val threshold = config.signingThreshold
 
     val transferLeaves = transfer.leavesList
 
@@ -45,14 +53,17 @@ suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
         .build()
     val commitmentsResponse = stub.getSigningCommitments(commitmentsRequest)
     val allCommitments = commitmentsResponse.signingCommitmentsList
+    if (allCommitments.size < 3 * transferLeaves.size) {
+        throw SparkError.InvalidResponse("Got ${allCommitments.size} signing commitments, need ${3 * transferLeaves.size}")
+    }
 
     val cpfpRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
     val directRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
     val directFromCpfpRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
 
-    val perSoTweaks = mutableMapOf<String, Spark.ClaimLeafKeyTweaks.Builder>()
-    for (soID in soOperators.keys) {
-        perSoTweaks[soID] = Spark.ClaimLeafKeyTweaks.newBuilder()
+    val perSoTweaks = linkedMapOf<String, Spark.ClaimLeafKeyTweaks.Builder>()
+    for (target in targets) {
+        perSoTweaks[target.soID] = Spark.ClaimLeafKeyTweaks.newBuilder()
     }
 
     for (i in transferLeaves.indices) {
@@ -143,14 +154,14 @@ suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
         )
 
         // Build pubkey shares tweak map
-        val pubkeyBySOID = mutableMapOf<String, ByteArray>()
-        for ((soID, soInfo) in soOperators) {
-            val matchedShare = vssShares.first { it.index == soInfo.index.toUInt() + 1u }
-            pubkeyBySOID[soID] = getPublicKeyBytes(matchedShare.share, true)
+        val sharesByTarget = KeyTweakHelper.shares(vssShares, targets)
+        val pubkeyBySOID = linkedMapOf<String, ByteArray>()
+        for ((target, share) in sharesByTarget) {
+            pubkeyBySOID[target.soID] = getPublicKeyBytes(share.share, true)
         }
 
-        for ((soID, soInfo) in soOperators) {
-            val share = vssShares.first { it.index == soInfo.index.toUInt() + 1u }
+        for ((target, share) in sharesByTarget) {
+            val soID = target.soID
             val secretShareProto = Spark.SecretShare.newBuilder()
                 .setSecretShare(ByteString.copyFrom(share.share))
             for (proof in share.proofs) {
@@ -171,8 +182,7 @@ suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
     val claimPackageResult = KeyTweakHelper.encryptAndSign(
         transferID = transfer.id,
         perSoTweaks = builtTweaks,
-        soOperators = soOperators,
-        signingOperatorConfigs = config.signingOperators,
+        targets = targets,
         signer = signer,
         tag = "claim",
     )

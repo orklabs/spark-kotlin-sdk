@@ -28,7 +28,7 @@ import spark_token.SparkTokenServiceGrpcKt
  *     val invoice = wallet.createLightningInvoice(amountSats = 1_000)
  *     // ... pay the invoice from an external wallet ...
  *     wallet.claimAllPendingTransfers()
- *     wallet.send(receiverIdentityPublicKey = recipient, amountSats = 500)
+ *     wallet.send(receiverSparkAddress = "spark1...", amountSats = 500)
  * } finally {
  *     wallet.close()
  * }
@@ -110,11 +110,17 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
          * @param account BIP-32 account index. When `null`, defaults to `1` on mainnet
          *   and `0` on regtest. Pass an explicit value to manage multiple accounts on
          *   the same mnemonic.
+         * @param validateMnemonic Reject phrases that fail BIP-39 wordlist or checksum
+         *   validation with [SparkError.InvalidMnemonic] instead of silently deriving a
+         *   different, empty wallet. Defaults to `true`; pass `false` only for phrases known
+         *   to be non-standard.
          * @return A ready-to-use wallet. Always pair with a `try { ... } finally { close() }`.
+         * @throws SparkError.InvalidMnemonic when validation is on and the phrase is not valid BIP-39.
+         * @throws SparkError.InvalidArgument for a negative [account].
          */
-        fun fromMnemonic(config: SparkConfig = SparkConfig(), mnemonic: String, account: Int? = null,): SparkWallet {
+        fun fromMnemonic(config: SparkConfig = SparkConfig(), mnemonic: String, account: Int? = null, validateMnemonic: Boolean = true): SparkWallet {
             val resolvedAccount = account ?: if (config.network == SparkNetwork.MAINNET) 1 else 0
-            val signer = SparkSigner.fromMnemonic(mnemonic, resolvedAccount)
+            val signer = SparkSigner.fromMnemonic(mnemonic, resolvedAccount, validateMnemonic = validateMnemonic)
             return SparkWallet(config, signer)
         }
 
@@ -159,10 +165,14 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
      * **Security:** the returned `ByteArray` contains highly sensitive material. Zero
      * it (`buf.fill(0)`) as soon as you have persisted it to secure storage.
      *
-     * @throws ClassCastException if the wallet was created via [fromSigner] with a
-     *   non-[SparkSigner] implementation that cannot export raw key bytes.
+     * @throws SparkError.InvalidArgument if the wallet was created via [fromSigner] with a
+     *   custom signer: only wallets created from a mnemonic or an account key can export it.
      */
-    fun exportAccountKey(): ByteArray = (signer as SparkSigner).exportAccountKey()
+    fun exportAccountKey(): ByteArray {
+        val keySigner = signer as? SparkSigner
+            ?: throw SparkError.InvalidArgument("exportAccountKey is only available for wallets created from a mnemonic or account key")
+        return keySigner.exportAccountKey()
+    }
 
     /**
      * Shut every operator connection down.

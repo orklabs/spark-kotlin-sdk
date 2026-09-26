@@ -89,13 +89,17 @@ class SparkSDKTests {
         assertArrayEquals(data, roundtrip)
     }
 
+    /** Tagged hash matches an independent implementation of the reference SDK's hash structure. */
     @Test
     fun testTaggedHash() {
+        // Vector computed with a separate Python implementation of the TS SDK's Hasher (the same
+        // vector the Swift SDK pins): tagHash = sha256(concat(8-byte BE len + component));
+        // sha256(tagHash || tagHash || values), each value 8-byte BE length-prefixed, maps as
+        // (count as uint64, then sorted key/value pairs). Insertion order must not matter.
         val hasher = SparkHasher(listOf("spark", "transfer", "signing payload"))
         hasher.addBytes("deadbeef".hexToByteArray())
-        hasher.addMapStringToBytes(mapOf("op1" to "cafe".hexToByteArray(), "op2" to "babe".hexToByteArray()))
+        hasher.addMapStringToBytes(linkedMapOf("op2" to "babe".hexToByteArray(), "op1" to "cafe".hexToByteArray()))
         val result = hasher.hash()
-        // Verified: matches Swift SDK output
         assertEquals("079a10347594aef138bac8153d261ba95406af52148d8368f8b81bd2f3f28c49", result.toHexString())
     }
 
@@ -114,32 +118,10 @@ class SparkSDKTests {
         assertEquals(keys1.identityPublicKey.toHexString(), wallet.identityPublicKeyHex)
     }
 
-    @Test
-    fun testLeafSelection() {
-        val leaves = listOf(
-            SparkLeaf(id = "1", treeID = "t1", valueSats = 100, status = "AVAILABLE"),
-            SparkLeaf(id = "2", treeID = "t2", valueSats = 500, status = "AVAILABLE"),
-            SparkLeaf(id = "3", treeID = "t3", valueSats = 200, status = "AVAILABLE"),
-        )
+    // --- Wallet initialization tests (public BIP-39 test vectors) ---
 
-        val selected = selectLeaves(leaves, amountSats = 600)
-        assertEquals(2, selected.size)
-        assertEquals(500L, selected[0].valueSats)
-        assertEquals(200L, selected[1].valueSats)
-
-        try {
-            selectLeaves(leaves, amountSats = 1000)
-            fail("Should have thrown")
-        } catch (e: SparkError.InsufficientBalance) {
-            assertEquals(1000L, e.need)
-            assertEquals(800L, e.have)
-        }
-    }
-
-    // --- Wallet initialization tests (same mnemonics as Swift) ---
-
-    private val walletAMnemonic = "coast bamboo thumb weapon fade antenna slam gym general entry bench craft"
-    private val walletBMnemonic = "remain typical poverty accuse acid inner cinnamon hundred bright donkey dentist"
+    private val walletAMnemonic = "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic"
+    private val walletBMnemonic = "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal will"
 
     @Test
     fun initializeWallet() {

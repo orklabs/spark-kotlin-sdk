@@ -119,6 +119,7 @@ suspend fun SparkWallet.payLightningInvoice(paymentRequest: String, amountSats: 
         signer = signer,
         soOperators = soOperators,
         signingOperatorConfigs = config.signingOperators,
+        threshold = config.signingThreshold,
     )
 
     // Step 2: Signing commitments for HTLC refunds
@@ -128,6 +129,9 @@ suspend fun SparkWallet.payLightningInvoice(paymentRequest: String, amountSats: 
         .build()
     val htlcCommitmentsResp = stub.getSigningCommitments(htlcCommitmentsReq)
     val htlcCommitments = htlcCommitmentsResp.signingCommitmentsList
+    if (htlcCommitments.size < 3 * selectedLeaves.size) {
+        throw SparkError.InvalidResponse("Got ${htlcCommitments.size} signing commitments, need ${3 * selectedLeaves.size}")
+    }
 
     val htlcCpfpJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
     val htlcDirectJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
@@ -228,6 +232,9 @@ suspend fun SparkWallet.payLightningInvoice(paymentRequest: String, amountSats: 
         .build()
     val swapCommitmentsResp = stub.getSigningCommitments(swapCommitmentsReq)
     val swapCommitments = swapCommitmentsResp.signingCommitmentsList
+    if (swapCommitments.size < selectedLeaves.size) {
+        throw SparkError.InvalidResponse("Got ${swapCommitments.size} signing commitments, need ${selectedLeaves.size}")
+    }
 
     val swapCpfpJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
 

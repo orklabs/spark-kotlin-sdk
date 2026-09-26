@@ -420,6 +420,21 @@ private suspend fun SparkWallet.broadcastTokenTransactionV2Detailed(
 
     val finalTx = startResponse.finalTokenTransaction
 
+    // The coordinator may only add server-set fields; anything else is refused before the
+    // wallet signs the final hash for each operator.
+    TokenTransactionValidator.validate(
+        final = finalTx,
+        partial = tokenTransaction,
+        keyshareInfo = if (startResponse.hasKeyshareInfo()) startResponse.keyshareInfo else null,
+        expectations = TokenTransactionValidator.Expectations(
+            operatorIdentityPublicKeys = collectOperatorIdentityPublicKeys(),
+            operatorIdentifiers = config.signingOperators.map { it.identifier }.toSet(),
+            threshold = config.signingThreshold,
+            withdrawBondSats = config.expectedWithdrawBondSats,
+            withdrawRelativeBlockLocktime = config.expectedWithdrawRelativeBlockLocktime,
+        ),
+    )
+
     // Phase 2: Hash final transaction and create per-operator signatures
     val finalHash = hashTokenTransactionV2(finalTx, partialHash = false)
     val operatorSignatures = buildOperatorSignatures(finalTx, finalHash)

@@ -316,6 +316,7 @@ suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): Str
         signer = signer,
         soOperators = soOperators,
         signingOperatorConfigs = config.signingOperators,
+        threshold = config.signingThreshold,
     )
 
     val transferPackageBuilder = Spark.TransferPackage.newBuilder()

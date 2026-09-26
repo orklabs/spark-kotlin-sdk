@@ -186,17 +186,38 @@ suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxF
 private const val INITIAL_ROOT_NODE_SEQUENCE: UInt = 0u
 private const val INITIAL_REFUND_SEQUENCE: UInt = 2000u
 
-suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt = 0u) {
+/**
+ * Claim an on-chain deposit to a one-time deposit address after it has been confirmed.
+ *
+ * The transaction's outputs are matched against the wallet's unused deposit addresses, so the
+ * claim is built for the leaf that actually received the funds.
+ *
+ * @param txID The on-chain transaction ID (display hex).
+ * @param vout The output index. Pass `null` (the default) to locate the output that pays one
+ *   of this wallet's deposit addresses; an explicit index must pay one of them.
+ */
+public suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt? = null) {
+    val txidBytes = txidBytesFromDisplayHex(txID)
     val stub = getCoordinatorStub()
     val networkStr = config.network.networkString
 
-    // Fetch raw tx from mempool API
+    // Fetch raw tx from the block explorer and make sure it is the transaction we asked for.
     val rawTx = fetchRawTransaction(txID)
+    if (!RawTransaction.parse(rawTx, context = "deposit tx").txid.contentEquals(txidBytes)) {
+        throw SparkError.UntrustedResponse("block explorer returned a transaction that does not hash to $txID")
+    }
 
-    // Query unused deposit addresses to find the matching one
-    val unusedAddresses = queryUnusedDepositAddresses()
-    val depositInfo = unusedAddresses.firstOrNull { it.leafId.isNotEmpty() }
+    // Query unused deposit addresses and find the output that pays one of them
+    val candidates = queryUnusedDepositAddresses().filter { it.leafId.isNotEmpty() }
+    val match = DepositMatcher.match(
+        rawTx = rawTx,
+        candidateAddresses = candidates.map { it.address },
+        requestedVout = vout,
+        network = config.network,
+    )
+    val depositInfo = candidates.firstOrNull { it.address == match.address }
         ?: throw SparkError.InvalidResponse("No unused deposit address found. Generate one first with getDepositAddress().")
+    val outputIndex = match.vout
 
     val leafId = depositInfo.leafId
     val verifyingKey = depositInfo.verifyingPublicKey
@@ -207,7 +228,7 @@ suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt = 0u) {
     // Create root node transaction pair
     val rootNodeTx = constructNodeTxPair(
         parentTx = rawTx,
-        vout = vout,
+        vout = outputIndex,
         address = depositInfo.address,
         sequence = INITIAL_ROOT_NODE_SEQUENCE,
         directSequence = SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
@@ -233,6 +254,9 @@ suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt = 0u) {
         .build()
     val commitmentsResp = stub.getSigningCommitments(commitmentsReq)
     val allCommitments = commitmentsResp.signingCommitmentsList
+    if (allCommitments.size < 3) {
+        throw SparkError.InvalidResponse("Got ${allCommitments.size} signing commitments, need 3")
+    }
 
     val rootJob = FrostSigningHelper.buildSigningJob(
         leafID = leafId,
@@ -259,12 +283,9 @@ suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt = 0u) {
         soCommitments = allCommitments[2].signingNonceCommitmentsMap,
     )
 
-    // txid reversed for protobuf
-    val txidBytes = txidBytesFromDisplayHex(txID)
-
     val utxo = Spark.UTXO.newBuilder()
         .setRawTx(ByteString.copyFrom(rawTx))
-        .setVout(vout.toInt())
+        .setVout(outputIndex.toInt())
         .setNetwork(config.network.toProto())
         .setTxid(ByteString.copyFrom(txidBytes))
         .build()

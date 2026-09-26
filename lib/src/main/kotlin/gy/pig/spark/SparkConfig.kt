@@ -45,13 +45,24 @@ data class SigningOperatorConfig(val address: String, val identifier: String, va
  *
  * @property network Bitcoin network (mainnet / regtest).
  * @property signingOperators The set of Spark operators the SDK will talk to. Order
- *   matters — the first entry is treated as the coordinator.
+ *   matters — the first entry is treated as the coordinator. Secret shares are only ever
+ *   encrypted to the identity keys listed here; a coordinator operator list that does not
+ *   match this configuration is refused.
  * @property sspURL Base GraphQL endpoint of the Spark Service Provider.
+ * @property signingThreshold FROST signing threshold the operators enforce. Defaults to the
+ *   reference SDK's value for the operator count (2 of 3 on mainnet).
+ * @property expectedWithdrawBondSats Withdraw bond the coordinator is expected to set on token
+ *   outputs (reference SDK: 10 000). A final token transaction with another value is refused.
+ * @property expectedWithdrawRelativeBlockLocktime Relative block locktime the coordinator is
+ *   expected to set on token outputs (reference SDK: 1 000).
  */
 data class SparkConfig(
     val network: SparkNetwork = SparkNetwork.MAINNET,
     val signingOperators: List<SigningOperatorConfig> = defaultOperators(network),
     val sspURL: String = "https://api.lightspark.com/graphql/spark/2025-03-19",
+    val signingThreshold: UInt = defaultThreshold(signingOperators.size),
+    val expectedWithdrawBondSats: ULong = 10_000uL,
+    val expectedWithdrawRelativeBlockLocktime: ULong = 1_000uL,
 ) {
     val signingOperatorAddresses: List<String>
         get() = signingOperators.map { it.address }
@@ -66,6 +77,9 @@ data class SparkConfig(
         }
 
     companion object {
+        /** The threshold the Spark deployments use for a given operator count (2 of 3, 3 of 5). */
+        fun defaultThreshold(operatorCount: Int): UInt = maxOf(2u, (maxOf(operatorCount, 0).toUInt() + 2u) / 2u)
+
         fun defaultOperators(network: SparkNetwork): List<SigningOperatorConfig> = when (network) {
             SparkNetwork.MAINNET -> listOf(
                 SigningOperatorConfig(

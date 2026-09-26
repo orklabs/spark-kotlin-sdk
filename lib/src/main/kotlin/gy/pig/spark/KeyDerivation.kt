@@ -29,7 +29,20 @@ class KeyDerivation private constructor(val accountKeyData: ByteArray, val accou
 
         val ecDomainParams = ECDomainParameters(ecSpec.curve, ecSpec.g, ecSpec.n, ecSpec.h)
 
-        fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = ""): KeyDerivation {
+        /**
+         * @param validateMnemonic Check the phrase against the BIP-39 English wordlist and
+         *   checksum first (throws [SparkError.InvalidMnemonic]). Pass `false` only to load a
+         *   phrase that is known to be non-standard.
+         * @throws SparkError.InvalidArgument for an account index outside `0..2^31-1`.
+         */
+        fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = "", validateMnemonic: Boolean = true): KeyDerivation {
+            if (validateMnemonic) {
+                BIP39.validate(mnemonic)
+            }
+            // Kotlin's Int tops out at 2^31-1, so only the lower bound needs checking.
+            if (account < 0) {
+                throw SparkError.InvalidArgument("account index must be between 0 and 2^31-1, got $account")
+            }
             val seed = mnemonicToSeed(mnemonic, passphrase)
             val master = hmacSHA512("Bitcoin seed".toByteArray(Charsets.UTF_8), seed)
 

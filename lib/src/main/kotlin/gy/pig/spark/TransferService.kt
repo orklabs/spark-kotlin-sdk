@@ -8,7 +8,36 @@ import uniffi.spark_frost.*
 import java.util.Date
 import java.util.UUID
 
-suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: Long,): SparkTransfer {
+/**
+ * Send sats to another Spark wallet identified by its bech32m Spark address
+ * (`spark1...` on mainnet, `sparkrt1...` on regtest). The address must be for the wallet's
+ * network.
+ *
+ * @throws SparkError.InvalidAddress for a malformed address or one for another network.
+ */
+public suspend fun SparkWallet.send(receiverSparkAddress: String, amountSats: Long): SparkTransfer {
+    val receiver = SparkAddress.decode(receiverSparkAddress, config.network)
+    return send(receiverIdentityPublicKey = receiver, amountSats = amountSats)
+}
+
+/** Validate the arguments of a Spark transfer before any leaf is selected or swapped. */
+internal fun validateSendArguments(receiverIdentityPublicKey: ByteArray, amountSats: Long) {
+    if (amountSats <= 0) {
+        throw SparkError.InvalidArgument("amountSats must be positive, got $amountSats")
+    }
+    if (receiverIdentityPublicKey.size != 33 ||
+        (receiverIdentityPublicKey[0] != 0x02.toByte() && receiverIdentityPublicKey[0] != 0x03.toByte())
+    ) {
+        throw SparkError.InvalidArgument("receiverIdentityPublicKey must be a 33-byte compressed secp256k1 public key")
+    }
+}
+
+/**
+ * Send sats to another Spark wallet identified by its 33-byte compressed identity public key.
+ * Leaves are selected from [getSpendableLeaves] and swapped to exactly [amountSats] first.
+ */
+public suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: Long,): SparkTransfer {
+    validateSendArguments(receiverIdentityPublicKey, amountSats)
     val selectedLeaves = selectLeavesWithSwap(amountSats)
 
     val stub = getCoordinatorStub()
@@ -25,6 +54,9 @@ suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: L
         .build()
     val commitmentsResponse = stub.getSigningCommitments(commitmentsRequest)
     val allCommitments = commitmentsResponse.signingCommitmentsList
+    if (allCommitments.size < 3 * selectedLeaves.size) {
+        throw SparkError.InvalidResponse("Got ${allCommitments.size} signing commitments, need ${3 * selectedLeaves.size}")
+    }
 
     val cpfpRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
     val directRefundJobs = mutableListOf<Spark.UserSignedTxSigningJob>()
@@ -104,6 +136,7 @@ suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: L
         signer = signer,
         soOperators = soOperators,
         signingOperatorConfigs = config.signingOperators,
+        threshold = config.signingThreshold,
     )
 
     val transferPackageBuilder = Spark.TransferPackage.newBuilder()
@@ -136,18 +169,6 @@ suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: L
         createdAt = Date(transfer.createdTime.seconds * 1000),
         sparkInvoice = transfer.sparkInvoice.takeIf { it.isNotEmpty() },
     )
-}
-
-fun selectLeaves(leaves: List<SparkLeaf>, amountSats: Long): List<SparkLeaf> {
-    val sorted = leaves.sortedByDescending { it.valueSats }
-    val selected = mutableListOf<SparkLeaf>()
-    var total = 0L
-    for (leaf in sorted) {
-        selected.add(leaf)
-        total += leaf.valueSats
-        if (total >= amountSats) return selected
-    }
-    throw SparkError.InsufficientBalance(need = amountSats, have = total)
 }
 
 /** Compute next cpfp and direct sequences from a refund tx. */

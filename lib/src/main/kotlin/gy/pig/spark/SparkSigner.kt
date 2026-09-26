@@ -56,8 +56,12 @@ interface SparkSignerProtocol {
 class SparkSigner private constructor(private val keys: KeyDerivation,) : SparkSignerProtocol {
 
     companion object {
-        fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = ""): SparkSigner =
-            SparkSigner(KeyDerivation.fromMnemonic(mnemonic, account, passphrase))
+        /**
+         * @param validateMnemonic Reject phrases that fail BIP-39 wordlist or checksum
+         *   validation ([SparkError.InvalidMnemonic]). Defaults to `true`.
+         */
+        fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = "", validateMnemonic: Boolean = true): SparkSigner =
+            SparkSigner(KeyDerivation.fromMnemonic(mnemonic, account, passphrase, validateMnemonic))
 
         fun fromAccountKey(accountKey: ByteArray, accountChainCode: ByteArray): SparkSigner =
             SparkSigner(KeyDerivation.fromAccountKey(accountKey, accountChainCode))

@@ -285,8 +285,27 @@ dependencies {
 
     // Testing
     testImplementation(libs.junit)
+    // Plain JNA jar for JVM unit tests: it carries the desktop libjnidispatch the aar lacks
+    // (only used when SPARK_FROST_HOST_LIBRARY is set, see below).
+    testImplementation(libs.jna)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+}
+
+// -----------------------------------------------------------------------------
+// Optional host FROST library for JVM unit tests.
+//
+// A few unit tests exercise the UniFFI FROST bindings (connector-refund sighashes,
+// VSS share mapping, ECIES). The bundled .so files are Android-only, so those tests
+// are skipped unless SPARK_FROST_HOST_LIBRARY points at a spark-frost build for the
+// host machine (e.g. a libspark_frost.dylib built from buildonspark/spark's
+// signer/spark-frost-uniffi at the same revision as the bundled bindings).
+// -----------------------------------------------------------------------------
+tasks.withType<Test>().configureEach {
+    val hostFrostLibrary = System.getenv("SPARK_FROST_HOST_LIBRARY")
+    if (!hostFrostLibrary.isNullOrBlank()) {
+        systemProperty("uniffi.component.spark_frost.libraryOverride", hostFrostLibrary)
+    }
 }
 
 // -----------------------------------------------------------------------------
