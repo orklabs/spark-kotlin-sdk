@@ -86,11 +86,14 @@ suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex
         ),
     )
 
-    val quote = result.getJSONObject("static_deposit_quote")
-    return DepositFeeEstimate(
-        creditAmountSats = quote.getLong("credit_amount_sats"),
-        quoteSignature = quote.getString("signature"),
-    )
+    // Strict like Swift's `as? Int64` / `as? String`: the credit amount is signed back to the SSP.
+    val quote = result.optJSONObject("static_deposit_quote")
+    val creditAmountSats = quote?.let { wholeNonNegativeLong(it.opt("credit_amount_sats")) }
+    val quoteSignature = quote?.stringOrNull("signature")
+    if (creditAmountSats == null || quoteSignature == null) {
+        throw SparkError.InvalidResponse("Invalid static deposit quote response")
+    }
+    return DepositFeeEstimate(creditAmountSats = creditAmountSats, quoteSignature = quoteSignature)
 }
 
 suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt = 0u,): String {

@@ -5,6 +5,8 @@ package gy.pig.spark
 import android.util.Base64
 import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import javax.crypto.Mac
@@ -51,6 +53,35 @@ private fun asciiHexDigit(c: Char): Int = when (c) {
  * `json[key] as? String`. (`JSONObject.optString` returns `"null"` for a JSON null.)
  */
 internal fun JSONObject.stringOrNull(key: String): String? = opt(key) as? String
+
+/** Largest double below which every whole value is exactly representable (2^53). */
+private const val MAX_EXACT_WHOLE_DOUBLE: Double = 9_007_199_254_740_992.0
+
+/**
+ * A whole, non-negative JSON number — the value of a GraphQL `Long` field — or `null`.
+ *
+ * `JSONObject.getLong` is too lenient for amounts: it truncates `12.5`, parses the string
+ * `"12"`, and saturates `1e19` to `Long.MAX_VALUE`. Here only whole values in
+ * `0..Long.MAX_VALUE` are accepted, like Swift's exact `as? Int64`: Android's org.json yields
+ * `Int`/`Long` for integer literals in range and `Double` for anything written with a fraction
+ * or exponent (or beyond `Long`), which counts only when it is whole and exactly representable
+ * (`1500.0` yes, `12.5` and `1e19` no). `BigInteger`/`BigDecimal` cover other org.json builds.
+ */
+internal fun wholeNonNegativeLong(value: Any?): Long? {
+    val whole = when (value) {
+        is Int -> value.toLong()
+        is Long -> value
+        is BigInteger -> if (value.bitLength() < Long.SIZE_BITS) value.toLong() else null
+        is Double -> if (value.isFinite() && value >= 0.0 && value <= MAX_EXACT_WHOLE_DOUBLE && value % 1.0 == 0.0) value.toLong() else null
+        is BigDecimal -> try {
+            value.longValueExact()
+        } catch (_: ArithmeticException) {
+            null
+        }
+        else -> null
+    }
+    return whole?.takeIf { it >= 0 }
+}
 
 /**
  * Run a best-effort step (Swift's `try?`): any failure is swallowed and reported as `null`,

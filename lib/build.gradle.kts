@@ -288,6 +288,9 @@ dependencies {
     // Plain JNA jar for JVM unit tests: it carries the desktop libjnidispatch the aar lacks
     // (only used when SPARK_FROST_HOST_LIBRARY is set, see below).
     testImplementation(libs.jna)
+    // Android's org.json is a stub that throws in JVM unit tests; this is the reference
+    // implementation, so the SSP response parsers can be tested on real JSON text.
+    testImplementation(libs.org.json)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

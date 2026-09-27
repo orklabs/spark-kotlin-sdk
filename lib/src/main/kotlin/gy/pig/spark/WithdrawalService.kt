@@ -3,7 +3,7 @@ package gy.pig.spark
 import com.google.protobuf.ByteString
 import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
-import org.json.JSONException
+import org.json.JSONObject
 import spark.Spark
 import uniffi.spark_frost.*
 import java.util.UUID
@@ -18,17 +18,25 @@ public suspend fun SparkWallet.getWithdrawalFeeEstimate(onChainAddress: String, 
         ),
     )
 
-    // Values are in sats
-    val totalFeeSats = try {
-        val speedFast = result.getJSONObject("coop_exit_fee_estimates").getJSONObject("speed_fast")
-        val userFee = speedFast.getJSONObject("user_fee").getLong("original_value")
-        val l1Fee = speedFast.getJSONObject("l1_broadcast_fee").getLong("original_value")
-        userFee + l1Fee
-    } catch (_: JSONException) {
+    return FeeQuote(feeSats = withdrawalFeeEstimateSats(result), feeRateSatsPerVbyte = 0)
+}
+
+/**
+ * The SSP's fast-exit fee in sats: its user fee plus the L1 broadcast fee. Both must be whole,
+ * non-negative numbers, and a sum that would overflow is refused instead of wrapping.
+ */
+internal fun withdrawalFeeEstimateSats(response: JSONObject): Long {
+    val fast = response.optJSONObject("coop_exit_fee_estimates")?.optJSONObject("speed_fast")
+    val userFee = fast?.optJSONObject("user_fee")?.let { wholeNonNegativeLong(it.opt("original_value")) }
+    val l1Fee = fast?.optJSONObject("l1_broadcast_fee")?.let { wholeNonNegativeLong(it.opt("original_value")) }
+    if (userFee == null || l1Fee == null) {
         throw SparkError.InvalidResponse("Invalid fee estimate response")
     }
-
-    return FeeQuote(feeSats = totalFeeSats, feeRateSatsPerVbyte = 0)
+    return try {
+        Math.addExact(userFee, l1Fee)
+    } catch (_: ArithmeticException) {
+        throw SparkError.UntrustedResponse("SSP withdrawal fee estimate $userFee + $l1Fee sats is out of range")
+    }
 }
 
 /**

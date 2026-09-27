@@ -4,7 +4,7 @@ import com.google.protobuf.ByteString
 import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
 import kotlinx.coroutines.CancellationException
-import org.json.JSONException
+import org.json.JSONObject
 import spark.Spark
 import uniffi.spark_frost.*
 import java.util.UUID
@@ -514,15 +514,22 @@ public suspend fun SparkWallet.getLightningSendFeeEstimate(encodedInvoice: Strin
         query = GraphQLQueries.LIGHTNING_SEND_FEE_ESTIMATE,
         variables = variables,
     )
+    return lightningFeeEstimateSats(response)
+}
 
-    val originalValue = try {
-        response.getJSONObject("lightning_send_fee_estimate")
-            .getJSONObject("fee_estimate")
-            .getLong("original_value")
-    } catch (_: JSONException) {
-        throw SparkError.InvalidResponse("Invalid fee estimate response")
+/**
+ * The SSP's lightning fee estimate, in whole sats rounded up. `original_value` is millisatoshi
+ * and must be a whole, non-negative number; a value whose rounding would overflow is refused
+ * instead of wrapping to a negative fee (which `payLightningInvoice` would then raise to 1 sat).
+ */
+internal fun lightningFeeEstimateSats(response: JSONObject): Long {
+    val msat = response.optJSONObject("lightning_send_fee_estimate")
+        ?.optJSONObject("fee_estimate")
+        ?.let { wholeNonNegativeLong(it.opt("original_value")) }
+        ?: throw SparkError.InvalidResponse("Invalid fee estimate response")
+    return try {
+        Math.addExact(msat, 999L) / 1000
+    } catch (_: ArithmeticException) {
+        throw SparkError.UntrustedResponse("SSP fee estimate of $msat msat is out of range")
     }
-
-    // originalValue is in millisats, convert to sats (ceiling)
-    return (originalValue + 999) / 1000
 }
