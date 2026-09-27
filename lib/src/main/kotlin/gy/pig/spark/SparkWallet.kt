@@ -2,6 +2,7 @@ package gy.pig.spark
 
 import io.grpc.Metadata
 import io.grpc.stub.MetadataUtils
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -201,12 +202,33 @@ public class SparkWallet private constructor(public val config: SparkConfig, pub
     }
 
     /**
+     * Accept event streams again after [close], and warm every operator's connection. Optional: a
+     * wallet that is never started connects on first use. A host app that closes the wallet in the
+     * background calls `start()` and then [subscribeToEvents] when it returns.
+     */
+    public suspend fun start() {
+        eventStreams.reopen()
+        for (address in config.signingOperatorAddresses) {
+            try {
+                // Asks an idle channel to connect now instead of on its first call.
+                connectionManager.getChannel(address).getState(true)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: kotlin.Exception) {
+                // Best effort, as in Swift: the first call reports what is wrong with the operator.
+            }
+        }
+    }
+
+    /**
      * Stop the wallet's event streams and shut every operator connection down.
      *
-     * The wallet stays usable for everything but events: the next call after `close()` builds
-     * fresh channels (that is how a host app cycles connections around backgrounding), while
-     * running [subscribeToEvents] collections end and new ones are refused. Safe to call more than
-     * once. Always pair construction with a `try / finally` to avoid leaking gRPC connections.
+     * The wallet stays usable: the next call after `close()` builds fresh channels, and the next
+     * [start] accepts event streams again. That is how a host app cycles connections around
+     * backgrounding: `close()` in the background, then `start()` and [subscribeToEvents] in the
+     * foreground. Running [subscribeToEvents] collections end, and new ones are refused until
+     * [start]. Safe to call more than once. Always pair construction with a `try / finally` to
+     * avoid leaking gRPC connections.
      */
     public suspend fun close() {
         eventStreams.close()

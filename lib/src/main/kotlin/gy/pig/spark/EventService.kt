@@ -16,14 +16,17 @@ import spark.Spark
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
-/** The wallet's running event streams, so that [SparkWallet.close] can stop them. */
+/**
+ * The wallet's running event streams, so that [SparkWallet.close] can stop them and
+ * [SparkWallet.start] can accept new ones again.
+ */
 internal class EventStreamRegistry {
     private val jobs = mutableSetOf<Job>()
     private var closed = false
 
     val isClosed: Boolean @Synchronized get() = closed
 
-    /** Registers a stream's job; false once the wallet is closed. */
+    /** Registers a stream's job; false while the wallet is closed. */
     @Synchronized
     fun register(job: Job): Boolean {
         if (closed) return false
@@ -36,13 +39,19 @@ internal class EventStreamRegistry {
         jobs.remove(job)
     }
 
-    /** Stops every running stream and refuses new ones. */
+    /** Stops every running stream and refuses new ones until [reopen]. */
     fun close() {
         val running = synchronized(this) {
             closed = true
             jobs.toList().also { jobs.clear() }
         }
         running.forEach { it.cancel() }
+    }
+
+    /** Accepts new streams again after [close]. */
+    @Synchronized
+    fun reopen() {
+        closed = false
     }
 }
 
@@ -123,14 +132,16 @@ internal val EVENT_STREAM_HEARTBEAT_TIMEOUT: Duration = 15.seconds
  *   without closing, as after a network change — is dropped and resubscribed.
  *
  * The flow is cold: each collection runs its own subscription. [SparkWallet.close] ends every
- * running collection normally.
+ * running collection normally, and new subscriptions are refused until the next
+ * [SparkWallet.start].
  *
- * @throws SparkError.InvalidArgument when the wallet is already closed.
+ * @throws SparkError.InvalidArgument while the wallet is closed: after [SparkWallet.close] and
+ *   before the next [SparkWallet.start].
  */
 public suspend fun SparkWallet.subscribeToEvents(): Flow<SparkEvent> = subscribeToEvents(EVENT_STREAM_HEARTBEAT_TIMEOUT)
 
 internal fun SparkWallet.subscribeToEvents(heartbeatTimeout: Duration): Flow<SparkEvent> {
-    if (eventStreams.isClosed) throw SparkError.InvalidArgument("the wallet is closed")
+    if (eventStreams.isClosed) throw SparkError.InvalidArgument("the wallet is closed; start() it before subscribing")
     return channelFlow {
         val run = launch { runEventStream(this@channelFlow, heartbeatTimeout) }
         if (!eventStreams.register(run)) {

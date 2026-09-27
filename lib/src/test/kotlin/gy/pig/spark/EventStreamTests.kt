@@ -121,7 +121,7 @@ class EventStreamConnectionTests {
     }
 
     @Test(timeout = 60_000)
-    fun closingTheWalletEndsItsEventStreamsAndRefusesNewOnes() = runBlocking<Unit> {
+    fun closingTheWalletEndsItsEventStreamsAndRefusesNewOnesUntilStart() = runBlocking<Unit> {
         val state = FakeOperatorState { false }
         state.subscription = FakeOperatorState.Subscription.SILENCE
         withFakeOperator(state) { wallet ->
@@ -138,6 +138,24 @@ class EventStreamConnectionTests {
                 assertEquals(listOf(SparkEvent.Connected), events)
             }
             expectSparkErrorSuspending { wallet.subscribeToEvents() }
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun startAfterCloseAcceptsEventStreamsAgainAsAHostAppCyclesTheWalletAroundBackgrounding() = runBlocking<Unit> {
+        val state = FakeOperatorState { false }
+        state.subscription = FakeOperatorState.Subscription.SILENCE
+        withFakeOperator(state) { wallet ->
+            coroutineScope {
+                val first = async { wallet.subscribeToEvents().toList() }
+                while (!state.methods.contains("subscribe_to_events")) delay(10)
+                delay(100)
+                wallet.close()
+                // The stream close() ended stays ended.
+                assertEquals(listOf(SparkEvent.Connected), withTimeoutOrNull(10_000) { first.await() })
+            }
+            wallet.start()
+            assertEquals(SparkEvent.Connected, withTimeoutOrNull(10_000) { wallet.subscribeToEvents().first() })
         }
     }
 

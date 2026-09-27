@@ -495,9 +495,11 @@ is exhausted) surface as `io.grpc.StatusException`.
 
 - Every I/O method is `suspend`. Call from any coroutine scope.
 - Real-time event subscription returns a `kotlinx.coroutines.flow.Flow<SparkEvent>`.
-- gRPC channels are managed internally; `SparkWallet.close()` cancels the internal
-  scope and shuts down channels — always call it (use `try`/`finally` or `use`-style
-  scoping) to avoid leaking connections.
+- gRPC channels are managed internally; `SparkWallet.close()` ends the wallet's event streams
+  and shuts down channels — always call it (use `try`/`finally` or `use`-style scoping) to avoid
+  leaking connections. The wallet stays usable afterwards: the next call reconnects, and new
+  event streams are refused until `start()`, so an app that closes the wallet in the background
+  calls `start()` and then `subscribeToEvents()` when it returns.
 - The SDK is **not** main-thread-safe — never invoke `suspend` calls from
   `Dispatchers.Main` without offloading. Prefer `Dispatchers.IO`.
 

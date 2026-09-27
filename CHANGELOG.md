@@ -13,7 +13,19 @@ migration note.
 
 ## [Unreleased]
 
-Nothing yet.
+Brings the Kotlin SDK level with spark-swift-sdk 0.3.1.
+
+### Added
+- `SparkWallet.start()`: accepts event streams again after `close()` and warms every operator's
+  connection (optional otherwise: a wallet connects on first use), as the Swift SDK's `start()`.
+
+### Fixed
+- Event streams can be opened again after `close()`. Since 0.3.0 `close()` ends the wallet's
+  event streams and refuses new ones, and nothing lifted that, so an app that cycles the wallet
+  around backgrounding as `close()` documents (`close()` in the background, `subscribeToEvents()`
+  on return) got `SparkError.InvalidArgument` from its second foreground on and saw no events
+  until it built a new `SparkWallet`. `close()` now refuses new streams only until the next
+  `start()`.
 
 ---
 
