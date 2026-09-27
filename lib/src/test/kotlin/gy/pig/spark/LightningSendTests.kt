@@ -8,16 +8,16 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
-import spark.Spark
 import java.io.IOException
 
 /**
- * The part of a lightning send that runs after the coordinator may hold the leaves: the SSP
- * step must surface the transfer id however it ends, and resuming must not select new leaves.
+ * The part of a lightning send that runs after the coordinator may hold the leaves: the SSP step
+ * must surface the transfer id however it ends, even when the caller is cancelled (Kotlin only:
+ * the swap and the SSP step run under `NonCancellable`). Resuming is covered by
+ * `LightningResumeTests`.
  */
 class LightningSendTests {
 
@@ -98,76 +98,5 @@ class LightningSendTests {
             }
             assertTrue(sspFinished)
         }
-    }
-
-    // ── resuming with a transferId ─────────────────────────────────────────
-
-    private val us = byteArrayOf(0x02) + bytes(0x11, 32)
-    private val ssp = byteArrayOf(0x03) + bytes(0x22, 32)
-
-    private fun lockedSend(
-        sender: ByteArray = us,
-        receiver: ByteArray = ssp,
-        total: Long = 1_050,
-        type: Spark.TransferType = Spark.TransferType.PREIMAGE_SWAP,
-        status: Spark.TransferStatus = Spark.TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAK_PENDING,
-    ): Spark.Transfer = Spark.Transfer.newBuilder()
-        .setId(transferId)
-        .setSenderIdentityPublicKey(sender.toByteString())
-        .setReceiverIdentityPublicKey(receiver.toByteString())
-        .setTotalValue(total)
-        .setType(type)
-        .setStatus(status)
-        .build()
-
-    private fun resume(existing: Spark.Transfer?, amountSats: Long = 1_000, maxFeeSats: Long = 50) =
-        canResumeLightningSend(existing, ownIdentityPublicKey = us, sspIdentityPublicKey = ssp, invoiceAmountSats = amountSats, maxFeeSats = maxFeeSats)
-
-    @Test
-    fun nothingUnderTheIdYetMeansANewSendUnderThatId() {
-        assertFalse(resume(null))
-    }
-
-    @Test
-    fun ourLockedTransferToTheSspCoveringTheInvoiceIsResumedWithoutNewLeaves() {
-        assertTrue(resume(lockedSend()))
-        // The fee is whatever was agreed when the transfer was created, as long as it is within the cap.
-        assertTrue(resume(lockedSend(total = 1_000)))
-        assertTrue(resume(lockedSend(total = 1_050), maxFeeSats = 50))
-        assertTrue(resume(lockedSend(status = Spark.TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAKED)))
-    }
-
-    @Test
-    fun anIdThatBelongsToSomethingElseIsRefused() {
-        val cases = listOf(
-            "another wallet's transfer" to lockedSend(sender = byteArrayOf(0x02) + bytes(0x33, 32)),
-            "a transfer to us" to lockedSend(sender = ssp, receiver = us),
-            "not to the SSP" to lockedSend(receiver = byteArrayOf(0x02) + bytes(0x44, 32)),
-            "a cooperative exit" to lockedSend(type = Spark.TransferType.COOPERATIVE_EXIT),
-            "a leaf swap" to lockedSend(type = Spark.TransferType.PRIMARY_SWAP_V3),
-            "expired" to lockedSend(status = Spark.TransferStatus.TRANSFER_STATUS_EXPIRED),
-            "returned" to lockedSend(status = Spark.TransferStatus.TRANSFER_STATUS_RETURNED),
-            "less than the invoice" to lockedSend(total = 999),
-        )
-        for ((label, transfer) in cases) {
-            val error = expectSparkError(label) { resume(transfer) }
-            assertTrue(label, error is SparkError.InvalidArgument)
-        }
-        // A transfer that would pay more than the caller now allows as a fee.
-        val fee = expectSparkError { resume(lockedSend(total = 1_051), maxFeeSats = 50) }
-        assertTrue(fee is SparkError.FeeExceedsLimit)
-        assertEquals(51L, (fee as SparkError.FeeExceedsLimit).feeSats)
-    }
-
-    @Test
-    fun theSspStepCarriesEitherTheIdempotencyKeyOrTheTransferId() {
-        assertEquals(
-            mapOf("encoded_invoice" to "lnbc1", "user_outbound_transfer_external_id" to transferId),
-            lightningSendVariables("lnbc1", idempotencyKey = null, transferId = transferId),
-        )
-        assertEquals(
-            mapOf("encoded_invoice" to "lnbc1", "idempotency_key" to "key-1"),
-            lightningSendVariables("lnbc1", idempotencyKey = "key-1", transferId = transferId),
-        )
     }
 }

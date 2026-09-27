@@ -3,6 +3,7 @@ package gy.pig.spark
 import com.google.protobuf.ByteString
 import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
+import io.grpc.Status
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -65,45 +66,16 @@ public suspend fun SparkWallet.createLightningInvoice(amountSats: Long, memo: St
         network = config.network,
     )
 
-    // Split preimage and store encrypted shares with SOs using config-based identifiers/keys
-    val soConfigs = config.signingOperators
-    val numOperators = soConfigs.size.toUInt()
-    val threshold = config.signingThreshold
-
-    val shares = splitSecretWithProofsUniffi(preimage, threshold, numOperators)
-
-    val stub = getCoordinatorStub()
-
-    @Suppress("DEPRECATION")
-    val storeRequestBuilder = Spark.StorePreimageShareV2Request.newBuilder()
-        .setPaymentHash(ByteString.copyFrom(paymentHash))
-        .setThreshold(threshold.toInt())
-        .setInvoiceString(encodedInvoice)
-        .setUserIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
-
-    // Match shares to operators by array index, encrypt to each SO's identity key
-    for (i in soConfigs.indices) {
-        val soConfig = soConfigs[i]
-        val share = shares[i]
-
-        val secretShareProto = Spark.SecretShare.newBuilder()
-            .setSecretShare(ByteString.copyFrom(share.share))
-        for (proof in share.proofs) {
-            secretShareProto.addProofs(ByteString.copyFrom(proof))
-        }
-
-        val shareBytes = secretShareProto.build().toByteArray()
-        val identityPubKey = soConfig.identityPublicKeyHex.hexToBytesOrNull()
-        if (identityPubKey == null || identityPubKey.isEmpty()) {
-            throw SparkError.InvalidArgument("operator ${soConfig.identifier} has no identity public key configured")
-        }
-        val encrypted = encryptEcies(shareBytes, identityPubKey)
-        storeRequestBuilder.putEncryptedPreimageShares(soConfig.identifier, ByteString.copyFrom(encrypted))
-    }
-
-    // V2 request has user_signature reserved (removed) — no signing needed
-
-    stub.storePreimageShareV2(storeRequestBuilder.build())
+    // Split the preimage and store one encrypted share with each operator.
+    val shares = splitSecretWithProofsUniffi(preimage, config.signingThreshold, config.signingOperators.size.toUInt())
+    val storeRequest = storePreimageShareRequest(
+        paymentHash = paymentHash,
+        shares = shares,
+        encodedInvoice = encodedInvoice,
+        identityPublicKey = signer.identityPublicKey,
+        config = config,
+    )
+    getCoordinatorStub().storePreimageShareV2(storeRequest)
 
     return LightningInvoice(
         paymentRequest = encodedInvoice,
@@ -133,21 +105,27 @@ internal fun validateInvoiceRequest(amountSats: Long, memo: String?, expirySecs:
  * Once the coordinator is asked to lock the leaves, the send runs to completion even if the
  * calling coroutine is cancelled: either the SSP request id is returned or
  * [SparkError.LightningSendIncomplete] carries the transfer id, so a locked transfer is never
- * left behind without it.
+ * left behind without it. The same error reports a preimage swap whose outcome is unknown (a
+ * connection lost after the request went out, a deadline, an internal error).
  *
  * @param paymentRequest BOLT-11 invoice. Must be for the wallet's network
- *   ([SparkError.InvalidInvoice] otherwise).
+ *   ([SparkError.InvalidInvoice] otherwise) and carry a payment secret. It is sent on trimmed and
+ *   in lower case.
  * @param maxFeeSats Highest routing fee the caller accepts. The SSP's fee estimate is fetched
- *   first and the payment is refused with [SparkError.FeeExceedsLimit] if it is higher.
+ *   first and the payment is refused with [SparkError.FeeExceedsLimit] if it is higher; the
+ *   estimate is offered as is, so `maxFeeSats = estimate` always goes through.
  * @param amountSats Amount to pay for an amountless invoice. Must be omitted (or equal) for an
  *   invoice that carries an amount.
  * @param idempotencyKey Optional key for deduplication. If the same key is used for multiple
- *   calls, the server returns the same result instead of creating duplicates.
+ *   calls, the server returns the same result instead of creating duplicates. Without one the
+ *   transfer id keys the preimage swap.
  * @param transferId Optional UUID to make the whole send resumable. On
- *   [SparkError.LightningSendIncomplete] call again with the same id: when the coordinator
- *   already holds a transfer with this id — ours, to the SSP, covering the invoice amount plus a
- *   fee within [maxFeeSats] — the SDK goes straight back to the SSP without selecting or locking
- *   any other leaves.
+ *   [SparkError.LightningSendIncomplete] call again with the same id (and the same invoice,
+ *   amount and [idempotencyKey]): when the coordinator already holds that transfer, no leaf is
+ *   selected or locked again — the held transfer must pay this invoice's payment hash with at
+ *   most [maxFeeSats] on top — and the SSP is asked to pay from it. The SSP answers a repeated
+ *   request for a transfer with the request it already has, so a send that went through returns
+ *   its request id instead of paying twice.
  * @return The SSP lightning send request id.
  */
 public suspend fun SparkWallet.payLightningInvoice(
@@ -157,56 +135,140 @@ public suspend fun SparkWallet.payLightningInvoice(
     idempotencyKey: String? = null,
     transferId: String? = null,
 ): String {
-    val payment = checkLightningPayment(paymentRequest, maxFeeSats, amountSats, transferId)
-    val resumeTransferId = payment.resumeTransferId
+    val payment = LightningPayment(paymentRequest, maxFeeSats, amountSats, idempotencyKey, config.network)
+    val resumeTransferId = LightningValidator.normalizeTransferId(transferId)
 
-    // Resuming: a transfer the coordinator already holds under this id is the one an earlier call
-    // locked. Its leaves are TRANSFER_LOCKED, so selecting again would fail or swap other leaves.
+    // Resuming a send the coordinator already holds: its leaves are locked for this payment, so
+    // selecting leaves again would come up short (or swap for nothing) and a second swap would be
+    // refused. Check what it holds and have the SSP pay from that.
     if (resumeTransferId != null) {
-        val existing = queryTransferByIdOrNull(resumeTransferId)
-        if (canResumeLightningSend(existing, signer.identityPublicKey, config.requireSspIdentityPublicKey(), payment.amountSats, maxFeeSats)) {
-            return requestLightningSend(lightningSendVariables(paymentRequest, idempotencyKey, resumeTransferId), resumeTransferId)
+        val held = heldLightningSend(resumeTransferId)
+        if (held != null) {
+            LightningValidator.verifyHeldSend(
+                held,
+                transferId = resumeTransferId,
+                payment = payment,
+                identityPublicKey = signer.identityPublicKey,
+                sspIdentityPublicKey = config.requireSspIdentityPublicKey(),
+            )
+            return requestLightningSend(payment, resumeTransferId)
         }
     }
-
-    val feeSats = lightningSendFee(paymentRequest, payment, maxFeeSats)
-    val stub = getCoordinatorStub()
-
-    // Select leaves covering invoice amount + fee (with swap if needed)
-    val selectedLeaves = selectLeavesWithSwap(payment.amountSats + feeSats)
-    val soOperators = stub.getSigningOperatorList(Empty.getDefaultInstance()).signingOperatorsMap
-    val transferID = resumeTransferId ?: UUID.randomUUID().toString().lowercase()
-
-    val swapRequest = buildPreimageSwapRequest(
-        stub = stub,
-        paymentRequest = paymentRequest,
-        paymentHash = payment.invoice.paymentHash,
-        invoiceAmountSats = payment.amountSats,
-        feeSats = feeSats,
-        transferID = transferID,
-        selectedLeaves = selectedLeaves,
-        soOperators = soOperators,
-    )
-
-    // A caller-supplied transfer id doubles as the coordinator idempotency key, so a retry
-    // after a partial failure resumes the existing swap instead of starting a second one.
-    val coordinatorIdempotencyKey = idempotencyKey ?: resumeTransferId
-    val swapStub = if (coordinatorIdempotencyKey != null) getCoordinatorStubWithIdempotency(coordinatorIdempotencyKey) else stub
+    val sendTransferId = resumeTransferId ?: UUID.randomUUID().toString().lowercase()
+    val swapRequest = prepareLightningSend(payment, sendTransferId)
 
     // Never start locking leaves for a caller that is already cancelled. From here on the send
     // runs to completion regardless: the coordinator may lock the leaves as soon as it sees the
-    // request, and Swift's lightningSendIncomplete(transferId) contract needs the transfer id to
+    // request, and the LightningSendIncomplete(transferId) contract needs the transfer id to
     // reach the caller. Both calls are bounded (60 s RPC deadline, OkHttp timeouts).
     currentCoroutineContext().ensureActive()
     return withContext(NonCancellable) {
-        val swapResponse = swapStub.initiatePreimageSwapV3(swapRequest)
-        requestLightningSend(lightningSendVariables(paymentRequest, idempotencyKey, swapResponse.transfer.id), swapResponse.transfer.id)
+        val transfer = submitPreimageSwap(swapRequest, preimageSwapIdempotencyKey(payment.idempotencyKey, sendTransferId))
+        requestLightningSend(payment, transfer.id)
     }
 }
 
 /**
- * Steps 1-3 of a lightning send, before anything is submitted: key tweaks and user-signed HTLC
- * refunds in a TransferPackage, wrapped in the `initiate_preimage_swap_v3` request.
+ * The Lightning send this wallet started under [transferId], as the coordinator holds it — its
+ * HTLC (preimage request) with the transfer — or `null` when the coordinator holds none.
+ */
+internal suspend fun SparkWallet.heldLightningSend(transferId: String): Spark.PreimageRequestWithTransfer? {
+    val request = Spark.QueryHtlcRequest.newBuilder()
+        .setIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
+        .addTransferIds(transferId)
+        .setMatchRole(Spark.PreimageRequestRole.PREIMAGE_REQUEST_ROLE_SENDER)
+        .setLimit(1)
+        .build()
+    return getCoordinatorStub().queryHtlc(request).preimageRequestsList.firstOrNull()
+}
+
+/**
+ * Steps 1–3 of a Lightning send, before anything is submitted: quote the fee against the cap,
+ * select leaves for amount + fee (swapping if needed), and build the `initiate_preimage_swap_v3`
+ * request that hands them to the coordinator as an HTLC transfer to the SSP.
+ */
+private suspend fun SparkWallet.prepareLightningSend(payment: LightningPayment, transferId: String): Spark.InitiatePreimageSwapRequest {
+    val feeEstimate = getLightningSendFeeEstimate(encodedInvoice = payment.encodedInvoice, amountSats = payment.amountlessInvoiceAmountSats)
+    val feeSats = LightningValidator.sendFeeSats(estimate = feeEstimate, maxFeeSats = payment.maxFeeSats)
+    // Both are non-negative, so the sum can only overflow past Long.MAX_VALUE.
+    if (payment.amountSats > Long.MAX_VALUE - feeSats) {
+        throw SparkError.InvalidArgument("amount plus fee overflows")
+    }
+
+    val stub = getCoordinatorStub()
+    // Select leaves covering invoice amount + fee (with swap if needed)
+    val selectedLeaves = selectLeavesWithSwap(payment.amountSats + feeSats)
+    val soOperators = stub.getSigningOperatorList(Empty.getDefaultInstance()).signingOperatorsMap
+
+    return buildPreimageSwapRequest(
+        stub = stub,
+        paymentRequest = payment.encodedInvoice,
+        paymentHash = payment.invoice.paymentHash,
+        invoiceAmountSats = payment.amountSats,
+        feeSats = feeSats,
+        transferID = transferId,
+        selectedLeaves = selectedLeaves,
+        soOperators = soOperators,
+    )
+}
+
+/**
+ * Hand a Lightning send's preimage swap to the coordinator. A failure after which the coordinator
+ * may still have committed the swap — leaves locked under the transfer id — surfaces as
+ * [SparkError.LightningSendIncomplete] with that id, so the caller can resume instead of losing
+ * track of the leaves until the transfer expires.
+ */
+internal suspend fun SparkWallet.submitPreimageSwap(request: Spark.InitiatePreimageSwapRequest, idempotencyKey: String): Spark.Transfer {
+    val stub = getCoordinatorStubWithIdempotency(idempotencyKey)
+    return try {
+        stub.initiatePreimageSwapV3(request).transfer
+    } catch (e: kotlin.Exception) {
+        // Spelled out: `uniffi.spark_frost.*` brings its own `Exception` (FROST errors only).
+        if (!preimageSwapMayHaveCommitted(e)) throw e
+        throw SparkError.LightningSendIncomplete(
+            transferId = request.transferRequest.transferId,
+            reason = "the preimage swap's outcome is unknown: $e",
+        )
+    }
+}
+
+/**
+ * Whether a failed `initiate_preimage_swap_v3` may still have been committed by the coordinator.
+ * The statuses the operators give a request they refused before committing — validation,
+ * authentication, a leaf or resource that is not available, a lock conflict — rule it out.
+ * Anything else (a connection lost after the request went out, a deadline, a cancellation, an
+ * internal or unknown error) does not.
+ */
+internal fun preimageSwapMayHaveCommitted(error: Throwable): Boolean {
+    val status = error.grpcStatus ?: return true
+    return status.code !in PREIMAGE_SWAP_REFUSALS
+}
+
+private val PREIMAGE_SWAP_REFUSALS = setOf(
+    Status.Code.INVALID_ARGUMENT,
+    Status.Code.FAILED_PRECONDITION,
+    Status.Code.OUT_OF_RANGE,
+    Status.Code.NOT_FOUND,
+    Status.Code.ALREADY_EXISTS,
+    Status.Code.PERMISSION_DENIED,
+    Status.Code.UNAUTHENTICATED,
+    Status.Code.RESOURCE_EXHAUSTED,
+    Status.Code.ABORTED,
+    Status.Code.UNIMPLEMENTED,
+)
+
+/**
+ * The coordinator idempotency key of a Lightning send's preimage swap: the caller's key, else the
+ * transfer id — never none. The coordinator answers a repeated key with the transfer it already
+ * committed instead of running the swap again, so a transport retry of a swap whose answer was
+ * lost, or a retry after [SparkError.LightningSendIncomplete], gets that transfer rather than a
+ * duplicate-transfer rejection. The reference SDK always sends one (`idempotencyKey: transferId`).
+ */
+internal fun preimageSwapIdempotencyKey(idempotencyKey: String?, transferId: String): String = idempotencyKey ?: transferId
+
+/**
+ * Key tweaks and user-signed HTLC refunds in a TransferPackage, wrapped in the
+ * `initiate_preimage_swap_v3` request that hands [selectedLeaves] to the SSP.
  */
 private suspend fun SparkWallet.buildPreimageSwapRequest(
     stub: spark.SparkServiceGrpcKt.SparkServiceCoroutineStub,
@@ -218,16 +280,10 @@ private suspend fun SparkWallet.buildPreimageSwapRequest(
     selectedLeaves: List<SparkLeaf>,
     soOperators: Map<String, Spark.SigningOperatorInfo>,
 ): Spark.InitiatePreimageSwapRequest {
-    val networkStr = config.network.networkString
     // receiverIdentityPubkey = SSP identity public key (matching JS SDK)
     val receiverPubKey = config.requireSspIdentityPublicKey()
 
-    // Single shared expiry time — 16 days from now (matching JS SDK)
-    val expiryTime = Timestamp.newBuilder()
-        .setSeconds((System.currentTimeMillis() / 1000) + 16 * 24 * 60 * 60)
-        .build()
-
-    // Steps 1-2: key tweaks plus user-signed HTLC refunds, in one TransferPackage
+    // Key tweaks plus user-signed HTLC refunds, in one TransferPackage
     val transferPackage = buildHtlcTransferPackage(
         stub = stub,
         transferID = transferID,
@@ -235,15 +291,15 @@ private suspend fun SparkWallet.buildPreimageSwapRequest(
         paymentHash = paymentHash,
         receiverPubKey = receiverPubKey,
         soOperators = soOperators,
-        networkStr = networkStr,
+        networkStr = config.network.networkString,
     )
 
-    // Step 3: the initiate_preimage_swap_v3 request
     val transferRequest = Spark.StartTransferRequest.newBuilder()
         .setTransferId(transferID)
         .setOwnerIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
         .setReceiverIdentityPublicKey(ByteString.copyFrom(receiverPubKey))
-        .setExpiryTime(expiryTime)
+        // 16 days from now (matching JS SDK)
+        .setExpiryTime(Timestamp.newBuilder().setSeconds((System.currentTimeMillis() / 1000) + 16 * 24 * 60 * 60))
         .setTransferPackage(transferPackage)
         .build()
     return preimageSwapRequest(
@@ -280,6 +336,52 @@ internal fun preimageSwapRequest(
     )
     .setTransferRequest(transferRequest)
     .build()
+
+/**
+ * The `store_preimage_share_v2` request of a Lightning receive: each operator's share of the
+ * preimage, ECIES-encrypted to its configured identity key. An operator validates the share at
+ * its own index (`Index + 1`, which its identifier encodes), so each gets the share with that
+ * index whatever the order of the configuration — the reference SDK's `shares[operator.id]`. No
+ * `user_signature`: the current protocol reserves that field and the operators never read it
+ * (reference SDK 0.6.5).
+ */
+internal fun storePreimageShareRequest(
+    paymentHash: ByteArray,
+    shares: List<VerifiableSecretShareResult>,
+    encodedInvoice: String,
+    identityPublicKey: ByteArray,
+    config: SparkConfig,
+): Spark.StorePreimageShareV2Request {
+    val request = Spark.StorePreimageShareV2Request.newBuilder()
+        .setPaymentHash(ByteString.copyFrom(paymentHash))
+        .setThreshold(config.signingThreshold.toInt())
+        .setInvoiceString(encodedInvoice)
+        .setUserIdentityPublicKey(ByteString.copyFrom(identityPublicKey))
+    for (soConfig in config.signingOperators) {
+        val index = operatorShareIndex(soConfig.identifier)
+        val share = shares.firstOrNull { it.index == index }
+            ?: throw SparkError.InvalidArgument("no preimage share for operator ${soConfig.identifier}")
+        val secretShareProto = Spark.SecretShare.newBuilder()
+            .setSecretShare(ByteString.copyFrom(share.share))
+            .addAllProofs(share.proofs.map { ByteString.copyFrom(it) })
+            .build()
+        val identityPubKey = soConfig.identityPublicKeyHex.hexToBytesOrNull()
+        if (identityPubKey == null || identityPubKey.isEmpty()) {
+            throw SparkError.InvalidArgument("operator ${soConfig.identifier} has no identity public key configured")
+        }
+        request.putEncryptedPreimageShares(soConfig.identifier, ByteString.copyFrom(encryptEcies(secretShareProto.toByteArray(), identityPubKey)))
+    }
+    return request.build()
+}
+
+/**
+ * The secret-share index an operator validates its share at: its identifier, a 32-byte big-endian
+ * number equal to its index + 1. `null` for anything else.
+ */
+internal fun operatorShareIndex(identifier: String): UInt? {
+    if (identifier.length != 64 || !identifier.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
+    return identifier.toUIntOrNull(16)?.takeIf { it > 0u }
+}
 
 /**
  * Steps 1-2 of a lightning send: the key tweaks handing the leaves to the SSP and the
@@ -335,92 +437,43 @@ private suspend fun SparkWallet.buildHtlcTransferPackage(
     return transferPackageBuilder.build()
 }
 
-/** A lightning payment that passed the client-side checks that need no network call. */
-private class CheckedLightningPayment(val invoice: Bolt11Invoice, val amountSats: Long, val resumeTransferId: String?)
-
-/** The fee cap, the invoice's checksum, network and amount, and the resume id — checked before any call is made. */
-private fun SparkWallet.checkLightningPayment(paymentRequest: String, maxFeeSats: Long, amountSats: Long?, transferId: String?): CheckedLightningPayment {
-    if (maxFeeSats < 0) {
-        throw SparkError.InvalidArgument("maxFeeSats must not be negative, got $maxFeeSats")
+/**
+ * Variables of the SSP's `request_lightning_send`. `amount_sats` is set for an amountless invoice
+ * only — the SSP schema says it "should ONLY be set when the invoice amount is zero", and without
+ * it the SSP cannot pay one (reference SDK, CHANGELOG 0.7.6). The SSP accepts either
+ * `idempotency_key` or `user_outbound_transfer_external_id`, not both.
+ */
+internal fun lightningSendVariables(
+    encodedInvoice: String,
+    amountlessInvoiceAmountSats: Long?,
+    idempotencyKey: String?,
+    transferId: String,
+): Map<String, Any> {
+    val variables = mutableMapOf<String, Any>("encoded_invoice" to encodedInvoice)
+    if (amountlessInvoiceAmountSats != null) variables["amount_sats"] = amountlessInvoiceAmountSats
+    if (idempotencyKey != null) {
+        variables["idempotency_key"] = idempotencyKey
+    } else {
+        variables["user_outbound_transfer_external_id"] = transferId
     }
-    val invoice = Bolt11Invoice.decode(paymentRequest)
-    if (!invoice.belongsTo(config.network)) {
-        throw SparkError.InvalidInvoice("invoice is for ${invoice.network.label}, wallet is on ${config.network.networkString}")
-    }
-    val invoiceAmountSats = LightningValidator.resolvePaymentAmountSats(
-        invoiceAmountMsat = invoice.amountMsat,
-        requestedAmountSats = amountSats,
-    )
-    return CheckedLightningPayment(invoice, invoiceAmountSats, LightningValidator.normalizeTransferId(transferId))
-}
-
-/** The routing fee for a new send: the SSP's estimate (at least 1 sat), refused above the caller's cap. */
-private suspend fun SparkWallet.lightningSendFee(paymentRequest: String, payment: CheckedLightningPayment, maxFeeSats: Long): Long {
-    val feeEstimate = getLightningSendFeeEstimate(
-        encodedInvoice = paymentRequest,
-        amountSats = if (payment.invoice.amountMsat == null) payment.amountSats else null,
-    )
-    val feeSats = maxOf(feeEstimate, 1L)
-    if (feeSats > maxFeeSats) {
-        throw SparkError.FeeExceedsLimit(feeSats = feeSats, maxFeeSats = maxFeeSats)
-    }
-    // Both are positive, so the sum can only overflow past Long.MAX_VALUE.
-    if (payment.amountSats > Long.MAX_VALUE - feeSats) {
-        throw SparkError.InvalidArgument("amount plus fee overflows")
-    }
-    return feeSats
+    return variables
 }
 
 /**
- * Whether [existing] — what the coordinator holds under a caller's resume `transferId` — is a
- * lightning send this wallet already started for this payment, so the SSP step can be retried
- * without touching any leaf. `null` (nothing under that id yet) means a new send.
- *
- * A transfer that is not an outgoing preimage swap from this wallet to the SSP, whose leaves were
- * returned, or whose value does not cover the invoice amount plus a fee within [maxFeeSats] is
- * refused: resuming it could only pay the wrong thing, and starting over under the same id would
- * hand the coordinator's idempotency key to another request.
+ * Step 4 of a Lightning send: ask the SSP to pay the invoice from the transfer the coordinator
+ * holds. The leaves are locked for that transfer by now, so any failure surfaces its id for the
+ * app to resume (same `transferId`) or reconcile via the SSP; see [completeLightningSend].
  */
-internal fun canResumeLightningSend(
-    existing: Spark.Transfer?,
-    ownIdentityPublicKey: ByteArray,
-    sspIdentityPublicKey: ByteArray,
-    invoiceAmountSats: Long,
-    maxFeeSats: Long,
-): Boolean {
-    if (existing == null) return false
-    val id = existing.id
-    if (!existing.senderIdentityPublicKey.toByteArray().contentEquals(ownIdentityPublicKey) ||
-        !existing.receiverIdentityPublicKey.toByteArray().contentEquals(sspIdentityPublicKey) ||
-        existing.type != Spark.TransferType.PREIMAGE_SWAP
-    ) {
-        throw SparkError.InvalidArgument("transfer $id is not a lightning payment from this wallet; use a new transferId")
+private suspend fun SparkWallet.requestLightningSend(payment: LightningPayment, transferId: String): String {
+    val variables = lightningSendVariables(
+        encodedInvoice = payment.encodedInvoice,
+        amountlessInvoiceAmountSats = payment.amountlessInvoiceAmountSats,
+        idempotencyKey = payment.idempotencyKey,
+        transferId = transferId,
+    )
+    return completeLightningSend(transferId) {
+        sspClient.executeRaw(query = GraphQLMutations.REQUEST_LIGHTNING_SEND, variables = variables)
     }
-    if (existing.status == Spark.TransferStatus.TRANSFER_STATUS_EXPIRED || existing.status == Spark.TransferStatus.TRANSFER_STATUS_RETURNED) {
-        throw SparkError.InvalidArgument("transfer $id is ${existing.status} and its leaves were returned; start a new payment with a new transferId")
-    }
-    // total_value is uint64: anything that reads as negative is far beyond any real payment.
-    val total = existing.totalValue
-    if (total < invoiceAmountSats) {
-        throw SparkError.InvalidArgument("transfer $id holds $total sats, less than the invoice amount of $invoiceAmountSats sats")
-    }
-    val feeSats = total - invoiceAmountSats
-    if (feeSats > maxFeeSats) {
-        throw SparkError.FeeExceedsLimit(feeSats = feeSats, maxFeeSats = maxFeeSats)
-    }
-    return true
-}
-
-/** The `request_lightning_send` variables: the SSP takes either an idempotency key or the transfer's external id, not both. */
-internal fun lightningSendVariables(paymentRequest: String, idempotencyKey: String?, transferId: String): Map<String, Any> = if (idempotencyKey != null) {
-    mapOf("encoded_invoice" to paymentRequest, "idempotency_key" to idempotencyKey)
-} else {
-    mapOf("encoded_invoice" to paymentRequest, "user_outbound_transfer_external_id" to transferId)
-}
-
-/** The SSP half of a lightning send: `request_lightning_send` for [transferId], see [completeLightningSend]. */
-private suspend fun SparkWallet.requestLightningSend(variables: Map<String, Any>, transferId: String): String = completeLightningSend(transferId) {
-    sspClient.executeRaw(query = GraphQLMutations.REQUEST_LIGHTNING_SEND, variables = variables)
 }
 
 /**

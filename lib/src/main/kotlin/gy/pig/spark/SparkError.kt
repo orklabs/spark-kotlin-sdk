@@ -88,8 +88,9 @@ public sealed class SparkError(override val message: String) : Exception(message
         SparkError("Quoted fee of $feeSats sats exceeds the allowed maximum of $maxFeeSats sats")
 
     /**
-     * The coordinator locked leaves for a lightning payment but the SSP request failed.
-     * Retry `payLightningInvoice` with the same [transferId] to resume, or reconcile via
+     * The coordinator may hold leaves for a lightning payment: it locked them but the SSP request
+     * failed, or the preimage swap failed in a way that leaves its outcome unknown. Retry
+     * `payLightningInvoice` with the same invoice and [transferId] to resume, or reconcile via
      * `getTransferFromSsp`.
      */
     public data class LightningSendIncomplete(val transferId: String, val reason: String) :

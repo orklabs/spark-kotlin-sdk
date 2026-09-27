@@ -239,16 +239,19 @@ val zeroAmountPaymentId = wallet.payLightningInvoice(
 )
 
 // Make a send resumable: on SparkError.LightningSendIncomplete call again with the same
-// transferId. If the coordinator already holds that transfer (ours, to the SSP, covering the
-// invoice plus a fee within maxFeeSats) the SDK goes straight back to the SSP without selecting
-// or locking any other leaves.
+// invoice and transferId. The SDK finds the transfer the coordinator already holds and has the
+// SSP pay from it — no leaves are selected or locked again, and a send that already went
+// through returns its request id instead of paying twice.
 val transferId = java.util.UUID.randomUUID().toString()
 val resumable = wallet.payLightningInvoice(paymentRequest = "lnbc...", maxFeeSats = fee, transferId = transferId)
 ```
 
 Once the coordinator has been asked to lock the leaves, a send runs to completion even if the
 calling coroutine is cancelled: it ends with the SSP request id or with
-`SparkError.LightningSendIncomplete(transferId)`, never with the transfer id lost.
+`SparkError.LightningSendIncomplete(transferId)`, never with the transfer id lost. The same
+error reports a preimage swap whose outcome is unknown (a connection lost after the request went
+out, a deadline, an internal error). Invoices must carry a payment secret and are sent on trimmed
+and in lower case; `maxFeeSats = fee` with the estimate always goes through (no 1-sat floor).
 
 ### Spark transfers
 
@@ -265,14 +268,13 @@ val transfer2 = wallet.send(
     amountSats = 500,
 )
 
-// Receive side: claim pending inbound transfers. Each one is claimed independently, so a
-// transfer that fails verification does not block the rest; if any failed, the first failure
-// is rethrown after all were attempted.
-val claimed: Int = wallet.claimAllPendingTransfers()
+// Receive side: claim every pending inbound transfer. Claims run one at a time per wallet, and
+// a transfer that cannot be claimed is reported without blocking the others.
+val claim: PendingTransferClaim = wallet.claimPendingTransfers()
+// claim.claimedTransferIds, claim.failures (transferId + error; retried on the next pass)
 
-// Or get a per-transfer report without an exception:
-val report: SparkTransferClaim = wallet.claimPendingTransfers()
-// report.pending, report.claimed, report.failures (transferId + error each)
+// Or just the count (failures are not thrown):
+val claimed: Int = wallet.claimAllPendingTransfers()
 ```
 
 ### Withdrawals
@@ -300,18 +302,21 @@ will renew, exits every spendable leaf, and tells you what stayed behind:
 ```kotlin
 val quote: WithdrawAllQuote = wallet.quoteWithdrawAll(onChainAddress = "bc1q...")
 // quote.spendableSats, quote.quotedFeeSats, quote.estimatedPayoutSats,
-// quote.frozenSats, quote.frozenFraction, quote.coversFee
+// quote.frozenSats, quote.unrenewedSats, quote.frozenFraction, quote.coversFee
 val result: WithdrawAllResult = wallet.withdrawAll(onChainAddress = "bc1q...", maxFeeSats = quote.quotedFeeSats)
-// result.txid, result.payoutSats, result.feeSats, result.frozenSats, result.lockedSats, result.unclaimedSats
+// result.txid, result.payoutSats, result.feeSats, result.frozenSats, result.unrenewedSats,
+// result.lockedSats, result.unclaimedSats
 ```
 
-The exited leaves stay transfer-locked, and therefore in `satsBalance.owned`, until the exit
-transaction confirms on-chain; `satsBalance.available` drops immediately.
-`satsBalance.frozen` reports sats in leaves at the timelock floor, which the operators will
-neither move nor renew and which only a unilateral exit can recover; `satsBalance.locked`
-reports sats held by in-flight operations. `getSpendableLeaves()` (and `SparkLeaf.isSpendable`
-/ `isRenewable`) is the leaf set every spend path selects from — use it or
-`satsBalance.available` for a "send everything" amount.
+The exited leaves stay in `satsBalance.owned` (as `locked`) until the operators apply the
+sender's key tweak; `satsBalance.available` drops immediately. `satsBalance.frozen` reports sats
+in leaves whose refund timelock is below 100 blocks (`SparkLeaf.isFrozen`), which the operators
+will neither move nor renew and which only a unilateral exit can recover. Leaves at 100–199
+blocks are renewable: they count as available, every spend path renews them first, and a drain
+reports any the operators did not renew as `unrenewedSats`. `satsBalance.locked` reports sats
+held by in-flight transfers, swaps and exits. `getSpendableLeaves()` (and
+`SparkLeaf.isSpendable` / `isRenewable` / `isFrozen`) is the leaf set every spend path selects
+from — use it or `satsBalance.available` for a "send everything" amount.
 
 ### Tokens
 
