@@ -142,7 +142,8 @@ private class DrainPlan(val leaves: List<SparkLeaf>, val balance: SatsBalance, v
  */
 private suspend fun SparkWallet.drainPlan(onChainAddress: String): DrainPlan {
     BitcoinAddress.scriptPubKey(onChainAddress, config.network)
-    bestEffort { claimAllPendingTransfers() }
+    // Claims are independent: whatever can be claimed is, and the rest is reported as incoming.
+    bestEffort { claimPendingTransfers() }
     val leaves = getSpendableLeaves()
     val balance = getBalance().satsBalance
     val spendable = leaves.sumOf { it.valueSats }

@@ -2,6 +2,7 @@ package gy.pig.spark
 
 import com.google.protobuf.ByteString
 import com.google.protobuf.Empty
+import kotlinx.coroutines.CancellationException
 import spark.Spark
 import uniffi.spark_frost.*
 
@@ -17,14 +18,68 @@ suspend fun SparkWallet.queryPendingTransfers(): List<Spark.Transfer> {
     return response.transfersList
 }
 
-suspend fun SparkWallet.claimAllPendingTransfers(): Int {
-    val transfers = queryPendingTransfers()
+/** A pending inbound transfer that could not be claimed. It stays pending; its sats stay in `incoming`. */
+public data class SparkTransferClaimFailure(public val transferId: String, public val error: kotlin.Exception)
+
+/**
+ * Outcome of [claimPendingTransfers]. Claims are per transfer: one failing transfer never
+ * blocks the rest.
+ */
+public data class SparkTransferClaim(
+    /** Pending inbound transfers found. */
+    public val pending: Int,
+    /** Transfers claimed. */
+    public val claimed: Int,
+    /** Transfers that could not be claimed, in the order they were attempted. */
+    public val failures: List<SparkTransferClaimFailure>,
+)
+
+/**
+ * Claim every pending inbound transfer (lightning receives, Spark transfers, swap and deposit
+ * settlements) and return how many were claimed.
+ *
+ * Each transfer is claimed independently, so one malformed or unverifiable transfer no longer
+ * leaves every later one unclaimed. If any failed, the first failure is rethrown once all of
+ * them were attempted, with further failures attached as suppressed exceptions — the same
+ * exception types callers caught before. Use [claimPendingTransfers] for a per-transfer report
+ * without an exception.
+ */
+public suspend fun SparkWallet.claimAllPendingTransfers(): Int = claimPendingTransfers().claimedOrThrow()
+
+/**
+ * Claim every pending inbound transfer independently and report each outcome. Only the query
+ * for pending transfers (and coroutine cancellation) can make this throw; a transfer that
+ * cannot be claimed is recorded in [SparkTransferClaim.failures] and the rest are still claimed.
+ *
+ * The Swift SDK's `claimAllPendingTransfers` still stops at the first failure.
+ */
+public suspend fun SparkWallet.claimPendingTransfers(): SparkTransferClaim = claimEach(queryPendingTransfers()) { claimTransfer(it) }
+
+/** Claim [transfers] one by one; a failure is recorded and the loop moves on. Cancellation is never swallowed. */
+internal suspend fun claimEach(transfers: List<Spark.Transfer>, claim: suspend (Spark.Transfer) -> Unit): SparkTransferClaim {
     var claimed = 0
+    val failures = mutableListOf<SparkTransferClaimFailure>()
     for (transfer in transfers) {
-        claimTransfer(transfer)
-        claimed++
+        try {
+            claim(transfer)
+            claimed++
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: kotlin.Exception) {
+            // Spelled out: `uniffi.spark_frost.*` brings its own `Exception` (FROST errors only).
+            failures.add(SparkTransferClaimFailure(transferId = transfer.id, error = e))
+        }
     }
-    return claimed
+    return SparkTransferClaim(pending = transfers.size, claimed = claimed, failures = failures)
+}
+
+/** [SparkTransferClaim.claimed], or the first failure (later ones attached as suppressed) when any claim failed. */
+internal fun SparkTransferClaim.claimedOrThrow(): Int {
+    val first = failures.firstOrNull()?.error ?: return claimed
+    for (other in failures.drop(1)) {
+        if (other.error !== first) first.addSuppressed(other.error)
+    }
+    throw first
 }
 
 /**
