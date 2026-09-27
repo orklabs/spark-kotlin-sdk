@@ -1,8 +1,12 @@
 package gy.pig.spark
 
+import com.google.protobuf.InvalidProtocolBufferException
+import spark.Spark
+
 /**
- * Spark addresses: a bech32m encoding of the protobuf `SparkAddress { identity_public_key = 1 }`
- * payload under a network-specific human-readable part.
+ * Spark addresses: a bech32m encoding of the protobuf `SparkAddress` payload under a
+ * network-specific human-readable part. A plain address carries only `identity_public_key`; a
+ * Spark invoice also carries `spark_invoice_fields` and the receiver's signature.
  */
 internal object SparkAddress {
     /** Current prefix plus the legacy one the reference SDK still accepts. */
@@ -21,11 +25,25 @@ internal object SparkAddress {
         return Bech32m.encode(hrp(network), Bech32.toWords(payload))
     }
 
+    /** A decoded Spark address or Spark invoice. */
+    class Payload(
+        val identityPublicKey: ByteArray,
+        /**
+         * Present when the string is a Spark invoice: what to pay (sats or tokens, and how much),
+         * until when, from whom, with a memo.
+         */
+        val invoiceFields: Spark.SparkInvoiceFields?,
+        /** The receiver's signature over an invoice. */
+        val signature: ByteArray?,
+    )
+
     /**
-     * The identity public key an address encodes. Throws [SparkError.InvalidAddress] for a
-     * malformed address or one for another network.
+     * Decode the whole `SparkAddress` payload of a Spark address or Spark invoice, as the
+     * reference SDK's `decodeSparkAddress` does. Throws [SparkError.InvalidAddress] for a
+     * malformed string, one for another network, or an identity key that is not a compressed
+     * secp256k1 point.
      */
-    fun decode(address: String, network: SparkNetwork): ByteArray {
+    fun decodePayload(address: String, network: SparkNetwork): Payload {
         val trimmed = address.trim()
         val (hrp, words) = try {
             Bech32m.decodeBech32m(trimmed)
@@ -36,16 +54,49 @@ internal object SparkAddress {
         if (hrp != current && hrp != legacy) {
             invalidAddress("'$trimmed' is not a ${network.networkString} Spark address (prefix '$hrp')")
         }
-        val payload = Bech32.fromWords(words)
+        val bytes = Bech32.fromWords(words)
             ?: invalidAddress("'$trimmed' has an invalid payload encoding")
-        // field 1 (identity_public_key), length-delimited, 33-byte compressed key
-        if (payload.size < 35 || payload[0] != 0x0a.toByte() || payload[1] != 33.toByte()) {
-            invalidAddress("'$trimmed' does not start with a 33-byte identity public key")
+        val payload = try {
+            Spark.SparkAddress.parseFrom(bytes)
+        } catch (_: InvalidProtocolBufferException) {
+            invalidAddress("'$trimmed' has an invalid payload encoding")
         }
-        val key = payload.copyOfRange(2, 35)
-        if (key[0] != 0x02.toByte() && key[0] != 0x03.toByte()) {
-            invalidAddress("'$trimmed' carries an invalid compressed public key")
+        val key = payload.identityPublicKey.toByteArray()
+        if (!isCompressedPoint(key)) {
+            invalidAddress("'$trimmed' does not carry a valid 33-byte identity public key")
         }
-        return key
+        return Payload(
+            identityPublicKey = key,
+            invoiceFields = if (payload.hasSparkInvoiceFields()) payload.sparkInvoiceFields else null,
+            signature = if (payload.hasSignature()) payload.signature.toByteArray() else null,
+        )
+    }
+
+    /**
+     * The identity public key a plain Spark address encodes. Throws [SparkError.InvalidAddress]
+     * for a malformed address, one for another network, or a Spark invoice: paying an invoice as
+     * if it were an address ignores its amount, expiry and sender restriction, and the transfer is
+     * not linked to it, so the payee never sees it paid (the reference SDK's `transfer` and
+     * `transferTokens` refuse invoices too).
+     */
+    fun decode(address: String, network: SparkNetwork): ByteArray {
+        val payload = decodePayload(address, network)
+        if (payload.invoiceFields != null) {
+            invalidAddress(
+                "this is a Spark invoice, not a Spark address; paying it as an address would ignore its amount, expiry and sender",
+            )
+        }
+        return payload.identityPublicKey
+    }
+
+    /** A 33-byte SEC1 compressed key that decodes to a point on secp256k1. */
+    private fun isCompressedPoint(key: ByteArray): Boolean {
+        if (key.size != 33 || (key[0] != 0x02.toByte() && key[0] != 0x03.toByte())) return false
+        return try {
+            KeyDerivation.ecDomainParams.curve.decodePoint(key)
+            true
+        } catch (_: IllegalArgumentException) {
+            false
+        }
     }
 }

@@ -18,6 +18,9 @@ public suspend fun SparkWallet.transferTokens(
     idempotencyKey: String? = null,
 ): String {
     val (rawTokenId, _) = decodeBech32mTokenIdentifier(tokenIdentifier, config.network)
+    // The receiver's identity key, from a Spark address for this network (a Spark invoice is
+    // refused), before any output is fetched.
+    val receiverData = SparkAddress.decode(receiverSparkAddress, config.network)
 
     val outputs = fetchTokenOutputs(tokenIdentifiers = listOf(rawTokenId))
     if (outputs.isEmpty()) {
@@ -25,8 +28,6 @@ public suspend fun SparkWallet.transferTokens(
     }
 
     val selected = selectTokenOutputs(outputs, tokenAmount, strategy)
-    // Decode receiver's Spark address (must be for this network) to get their identity public key
-    val receiverData = SparkAddress.decode(receiverSparkAddress, config.network)
 
     val tx = buildTransferTokenTransaction(
         selectedOutputs = selected,
