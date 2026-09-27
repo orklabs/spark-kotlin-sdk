@@ -246,4 +246,27 @@ class LightningValidatorTests {
         // java.util.UUID.fromString alone would accept this shortened form; Foundation does not.
         expectSparkError { LightningValidator.normalizeTransferId("1-2-3-4-5") }
     }
+
+    @Test
+    fun aLightningSendsPreimageSwapCarriesOnlyTheHtlcTransferRequest() {
+        val transferRequest = spark.Spark.StartTransferRequest.newBuilder()
+            .setTransferId("0199a8f0-0000-7000-8000-000000000001")
+            .setReceiverIdentityPublicKey((byteArrayOf(0x02) + bytes(0xAA, 32)).toByteString())
+            .setTransferPackage(spark.Spark.TransferPackage.newBuilder().setUserSignature(byteArrayOf(1, 2, 3).toByteString()))
+            .build()
+        val request = preimageSwapRequest(
+            paymentHash = bytes(0x42, 32),
+            invoiceAmountSats = 12,
+            bolt11Invoice = "lnbc120n1...",
+            feeSats = 2,
+            transferRequest = transferRequest,
+        )
+        // The legacy `transfer` field is reserved in the protocol and absent from the generated request.
+        assertEquals(transferRequest, request.transferRequest)
+        assertEquals(transferRequest.receiverIdentityPublicKey, request.receiverIdentityPublicKey)
+        assertEquals(spark.Spark.InitiatePreimageSwapRequest.Reason.REASON_SEND, request.reason)
+        assertEquals(2L, request.feeSats)
+        assertEquals(12L, request.invoiceAmount.valueSats)
+        assertEquals("lnbc120n1...", request.invoiceAmount.invoiceAmountProof.bolt11Invoice)
+    }
 }

@@ -205,8 +205,8 @@ public suspend fun SparkWallet.payLightningInvoice(
 }
 
 /**
- * Steps 1-4 of a lightning send, before anything is submitted: key tweaks and user-signed HTLC
- * refunds in a TransferPackage, plus the regular cpfp refunds for the swap transfer field.
+ * Steps 1-3 of a lightning send, before anything is submitted: key tweaks and user-signed HTLC
+ * refunds in a TransferPackage, wrapped in the `initiate_preimage_swap_v3` request.
  */
 private suspend fun SparkWallet.buildPreimageSwapRequest(
     stub: spark.SparkServiceGrpcKt.SparkServiceCoroutineStub,
@@ -238,38 +238,7 @@ private suspend fun SparkWallet.buildPreimageSwapRequest(
         networkStr = networkStr,
     )
 
-    // Step 3: Signing commitments and regular cpfp refunds for the swap transfer field
-    val swapCommitmentsReq = Spark.GetSigningCommitmentsRequest.newBuilder()
-        .setCount(3)
-        .addAllNodeIds(selectedLeaves.map { it.id })
-        .build()
-    val swapCommitments = stub.getSigningCommitments(swapCommitmentsReq).signingCommitmentsList
-    if (swapCommitments.size < selectedLeaves.size) {
-        throw SparkError.InvalidResponse("Got ${swapCommitments.size} signing commitments, need ${selectedLeaves.size}")
-    }
-    val swapCpfpJobs = buildSwapRefundJobs(
-        selectedLeaves = selectedLeaves,
-        receiverPubKey = receiverPubKey,
-        swapCommitments = swapCommitments,
-        networkStr = networkStr,
-    )
-
-    // Step 4: the initiate_preimage_swap_v3 request
-    val invoiceAmount = Spark.InvoiceAmount.newBuilder()
-        .setValueSats(invoiceAmountSats)
-        .setInvoiceAmountProof(Spark.InvoiceAmountProof.newBuilder().setBolt11Invoice(paymentRequest).build())
-        .build()
-
-    // transfer field (field 4): only cpfp regular refund jobs (direct/directFromCpfp undefined when transferRequest exists)
-    val transferField = Spark.StartUserSignedTransferRequest.newBuilder()
-        .setTransferId(transferID)
-        .setOwnerIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
-        .setReceiverIdentityPublicKey(ByteString.copyFrom(receiverPubKey))
-        .setExpiryTime(expiryTime)
-        .addAllLeavesToSend(swapCpfpJobs)
-        .build()
-
-    // transferRequest field (field 7): full StartTransferRequest with HTLC TransferPackage
+    // Step 3: the initiate_preimage_swap_v3 request
     val transferRequest = Spark.StartTransferRequest.newBuilder()
         .setTransferId(transferID)
         .setOwnerIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
@@ -277,17 +246,40 @@ private suspend fun SparkWallet.buildPreimageSwapRequest(
         .setExpiryTime(expiryTime)
         .setTransferPackage(transferPackage)
         .build()
-
-    return Spark.InitiatePreimageSwapRequest.newBuilder()
-        .setPaymentHash(ByteString.copyFrom(paymentHash))
-        .setReason(Spark.InitiatePreimageSwapRequest.Reason.REASON_SEND)
-        .setReceiverIdentityPublicKey(ByteString.copyFrom(receiverPubKey))
-        .setFeeSats(feeSats)
-        .setInvoiceAmount(invoiceAmount)
-        .setTransfer(transferField)
-        .setTransferRequest(transferRequest)
-        .build()
+    return preimageSwapRequest(
+        paymentHash = paymentHash,
+        invoiceAmountSats = invoiceAmountSats,
+        bolt11Invoice = paymentRequest,
+        feeSats = feeSats,
+        transferRequest = transferRequest,
+    )
 }
+
+/**
+ * The `initiate_preimage_swap_v3` request of a Lightning send: the HTLC transfer to the SSP in
+ * `transfer_request`, whose receiver the top-level receiver must equal. Only `transfer_request`:
+ * the operators build the swap from it alone, and the legacy `transfer` field — plain, non-HTLC
+ * refunds signed over to the SSP — is reserved in the current protocol; the reference SDK stopped
+ * sending it in 0.9.0.
+ */
+internal fun preimageSwapRequest(
+    paymentHash: ByteArray,
+    invoiceAmountSats: Long,
+    bolt11Invoice: String,
+    feeSats: Long,
+    transferRequest: Spark.StartTransferRequest,
+): Spark.InitiatePreimageSwapRequest = Spark.InitiatePreimageSwapRequest.newBuilder()
+    .setPaymentHash(ByteString.copyFrom(paymentHash))
+    .setReason(Spark.InitiatePreimageSwapRequest.Reason.REASON_SEND)
+    .setReceiverIdentityPublicKey(transferRequest.receiverIdentityPublicKey)
+    .setFeeSats(feeSats)
+    .setInvoiceAmount(
+        Spark.InvoiceAmount.newBuilder()
+            .setValueSats(invoiceAmountSats)
+            .setInvoiceAmountProof(Spark.InvoiceAmountProof.newBuilder().setBolt11Invoice(bolt11Invoice)),
+    )
+    .setTransferRequest(transferRequest)
+    .build()
 
 /**
  * Steps 1-2 of a lightning send: the key tweaks handing the leaves to the SSP and the
@@ -554,33 +546,6 @@ private fun SparkWallet.buildHtlcSigningJobs(
         )
     }
     return HtlcSigningJobs(cpfp = htlcCpfpJobs, direct = htlcDirectJobs, directFromCpfp = htlcDirectFromCpfpJobs)
-}
-
-/** Regular cpfp refund signing jobs for the swap transfer field of a lightning send. */
-private fun SparkWallet.buildSwapRefundJobs(
-    selectedLeaves: List<SparkLeaf>,
-    receiverPubKey: ByteArray,
-    swapCommitments: List<Spark.RequestedSigningCommitments>,
-    networkStr: String,
-): List<Spark.UserSignedTxSigningJob> = selectedLeaves.mapIndexed { i, leaf ->
-    val node = leaf.node ?: throw SparkError.InvalidResponse("Leaf ${leaf.id} missing node data")
-    val signingKey = signer.deriveLeafSigningKey(leaf.id)
-    val (nextSequence, _) = computeNextSequences(node.refundTx.toByteArray())
-    val cpfpRefund = constructRefundTx(
-        tx = node.nodeTx.toByteArray(),
-        vout = 0u,
-        pubkey = receiverPubKey,
-        network = networkStr,
-        sequence = nextSequence,
-    )
-    FrostSigningHelper.buildSigningJob(
-        leafID = leaf.id,
-        signingKey = signingKey,
-        verifyingKey = node.verifyingPublicKey.toByteArray(),
-        rawTx = cpfpRefund.tx,
-        sighash = cpfpRefund.sighash,
-        soCommitments = swapCommitments[i].signingNonceCommitmentsMap,
-    )
 }
 
 /** Fee estimate in sats (rounded up) for an outbound lightning payment. */
