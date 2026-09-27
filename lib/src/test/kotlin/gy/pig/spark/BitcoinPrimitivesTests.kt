@@ -146,13 +146,13 @@ class RawTransactionTests {
         assertFalse(legacyExtended.hasWitnessSerialization)
 
         val spend = constructSpendTx(
-            depositTxId = GENESIS_COINBASE_TXID,
-            outputIndex = 0u,
+            spending = DepositOutpoint(GENESIS_COINBASE_TXID, 0u),
             destinationAddress = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
             amountSats = 12_345uL,
             network = SparkNetwork.MAINNET,
         )
         val parsedSpend = RawTransaction.parse(spend)
+        assertFalse(parsedSpend.hasWitnessSerialization)
         assertEquals(3u, parsedSpend.version)
         assertArrayEquals(hex(GENESIS_COINBASE_TXID).reversedArray(), parsedSpend.inputs[0].previousTxid)
         assertArrayEquals(hex("512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"), parsedSpend.outputs[0].scriptPubKey)

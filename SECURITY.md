@@ -120,17 +120,26 @@ before any key material is used:
   overflow-checked amount) and belong to the wallet's network; the SSP fee estimate
   must be within `maxFeeSats`.
 - **Lightning receives** — the invoice the SSP returns must carry our payment hash,
-  amount and network before preimage shares are stored.
+  amount and network, and no Spark fallback the wallet did not ask for, before preimage
+  shares are stored; each operator gets the share at its own index.
 - **Inbound transfers** — every leaf's sender signature over
-  `sha256(leafId || transferId || secretCipher)` is verified against the sender
-  identity key, and the transfer must be addressed to this wallet, before any secret is
-  decrypted or refund signed.
+  `sha256(leafId || transferId || secretCipher)` (legacy ECDSA, or scheme-tagged strict-DER
+  ECDSA or BIP-340 Schnorr) is verified against the sender identity key, and the transfer
+  must be addressed to this wallet (a multi-receiver transfer is narrowed to this wallet's
+  leaves), before any secret is decrypted or refund signed.
 - **Token transactions** — the coordinator's final transaction must equal the
   submitted partial transaction apart from server-set fields, with the expected
   withdraw bond and locktime and a keyshare naming the configured operators.
 - **Operators** — secret shares are only ever encrypted to operator identity keys from
   the local configuration; a coordinator operator list that does not match the
   configuration is refused.
+- **Deposit addresses** — before a one-time or static deposit address is returned, the
+  operators' proof of possession (a BIP-340 signature by their share of the key over the
+  address, the wallet's identity key and that share) and every operator's signature over
+  the address (the coordinator's too, for static addresses) are verified against the
+  configured operator keys, and the address must pay the reported verifying key.
+- **Spark addresses** — decoded whole; a Spark invoice is refused where a plain address is
+  expected, and the identity key must be a point on secp256k1.
 - **Raw data** — transactions from operators, the SSP and the block explorer are
   parsed with bounds checks; addresses are decoded per network (BIP-173/350).
 - **Mnemonics** — validated against the BIP-39 English wordlist and checksum by default.

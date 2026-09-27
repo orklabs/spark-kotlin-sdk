@@ -4,10 +4,15 @@ import com.google.protobuf.ByteString
 import okhttp3.RequestBody.Companion.toRequestBody
 import spark.Spark
 import uniffi.spark_frost.*
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
 
+/**
+ * Generate a one-time deposit address. After sending BTC on-chain, call [claimDeposit].
+ *
+ * The address is verified before it is returned, as the reference SDK does: the operators' proof
+ * of possession, every operator's signature over it but the coordinator's, and that it pays the
+ * reported verifying key ([SparkError.UntrustedResponse] otherwise).
+ */
 public suspend fun SparkWallet.getDepositAddress(): DepositAddress {
     val stub = getCoordinatorStub()
 
@@ -28,6 +33,13 @@ public suspend fun SparkWallet.getDepositAddress(): DepositAddress {
 
     val response = stub.generateDepositAddress(request)
     val addr = response.depositAddress
+    DepositAddressVerifier.verify(
+        addr,
+        userSigningPublicKey = leafPublicKey,
+        identityPublicKey = signer.identityPublicKey,
+        isStatic = false,
+        config = config,
+    )
 
     return DepositAddress(
         address = addr.address,
@@ -37,20 +49,57 @@ public suspend fun SparkWallet.getDepositAddress(): DepositAddress {
     )
 }
 
+/**
+ * Generate a static (reusable) deposit address, or get the one the operators already hold for
+ * this wallet, for the static-deposit key (index 0) as the Swift and reference SDKs request it.
+ *
+ * The address is verified before it is returned: the operators' proof of possession, every
+ * operator's signature over it (the coordinator's included), and that it pays the reported
+ * verifying key ([SparkError.UntrustedResponse] otherwise).
+ */
 public suspend fun SparkWallet.getStaticDepositAddress(): StaticDepositAddress {
     val stub = getCoordinatorStub()
+    val staticPubKey = getPublicKeyBytes(signer.deriveStaticDepositKey(0), true)
 
     val request = Spark.GenerateStaticDepositAddressRequest.newBuilder()
         .setNetwork(config.network.toProto())
-        .setSigningPublicKey(ByteString.copyFrom(signer.depositPublicKey))
+        .setSigningPublicKey(ByteString.copyFrom(staticPubKey))
         .setIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
+        .setHashVariant(Spark.HashVariant.HASH_VARIANT_V2)
         .build()
 
-    val response = stub.generateStaticDepositAddress(request)
+    val deposit = stub.generateStaticDepositAddress(request).depositAddress
+    try {
+        DepositAddressVerifier.verify(
+            deposit,
+            userSigningPublicKey = staticPubKey,
+            identityPublicKey = signer.identityPublicKey,
+            isStatic = true,
+            config = config,
+        )
+    } catch (e: SparkError.UntrustedResponse) {
+        throw legacyStaticAddressError(deposit) ?: e
+    }
+    return StaticDepositAddress(address = deposit.address, verifyingKey = deposit.verifyingKey.toByteArray())
+}
 
-    return StaticDepositAddress(
-        address = response.depositAddress.address,
-        verifyingKey = response.depositAddress.verifyingKey.toByteArray(),
+/**
+ * spark-kotlin-sdk up to 0.2.2 requested the static deposit address for the account's deposit key
+ * (`2'`) instead of the static-deposit key (`3'/0'`) the claims and refunds sign with. The
+ * operators keep returning an address made that way, which the SDK cannot claim or refund: say so
+ * instead of reporting a bad proof.
+ */
+private fun SparkWallet.legacyStaticAddressError(deposit: Spark.Address): SparkError? {
+    val legacy = try {
+        DepositAddressVerifier.verify(deposit, signer.depositPublicKey, signer.identityPublicKey, isStatic = true, config = config)
+        true
+    } catch (_: SparkError) {
+        false
+    }
+    if (!legacy) return null
+    return SparkError.InvalidResponse(
+        "static deposit address ${deposit.address} was created by spark-kotlin-sdk 0.2.x for the deposit key instead of the " +
+            "static-deposit key; this SDK cannot claim or refund deposits to it",
     )
 }
 
@@ -76,12 +125,18 @@ public suspend fun SparkWallet.queryUnusedDepositAddresses(limit: Int = 100, off
     }
 }
 
-public suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex: UInt = 0u,): DepositFeeEstimate {
+/**
+ * Get the SSP's quote for claiming a static deposit (how much will be credited after fees).
+ * Without [outputIndex] the quote is for the output that pays this wallet's static deposit
+ * address. The txid may be in any case.
+ */
+public suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex: UInt? = null): DepositFeeEstimate {
+    val outpoint = DepositOutpoint(transactionId, staticDepositVout(transactionId, outputIndex))
     val result = sspClient.executeRaw(
         query = GraphQLQueries.STATIC_DEPOSIT_QUOTE,
         variables = mapOf(
-            "transaction_id" to transactionId,
-            "output_index" to outputIndex.toInt(),
+            "transaction_id" to outpoint.txid,
+            "output_index" to outpoint.vout.toInt(),
             "network" to config.network.networkGraphQL,
         ),
     )
@@ -96,41 +151,65 @@ public suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outp
     return DepositFeeEstimate(creditAmountSats = creditAmountSats, quoteSignature = quoteSignature)
 }
 
-public suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt = 0u,): String {
-    val feeEstimate = getDepositFeeEstimate(transactionId, outputIndex)
+/**
+ * Claim a static deposit for whatever credit the SSP quotes, unchecked. Without [outputIndex] the
+ * output that pays this wallet's static deposit address is claimed.
+ *
+ * @return The Spark transfer id of the claim.
+ */
+@Deprecated(
+    message = "Signs whatever credit the SSP quotes. Use claimStaticDepositWithMaxFee, or claimStaticDeposit(transactionId, outputIndex, quote) " +
+        "with a quote you checked.",
+)
+public suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt? = null): String {
+    val vout = staticDepositVout(transactionId, outputIndex)
+    val quote = getDepositFeeEstimate(transactionId, vout)
+    return claimStaticDeposit(transactionId, vout, quote)
+}
 
-    // Build signing payload matching Swift SDK
+/**
+ * Claim a static deposit for exactly the credit of [quote] — the SSP-signed quote
+ * [getDepositFeeEstimate] returned for this output — as the reference SDK's `claimStaticDeposit`
+ * does: the wallet signs a fixed-amount claim for that credit and the SSP's quote signature, so
+ * the SSP cannot credit less. Without [outputIndex] the output that pays this wallet's static
+ * deposit address is claimed. The txid may be in any case.
+ *
+ * @return The Spark transfer id of the claim.
+ * @throws SparkError.InvalidArgument for a quote crediting nothing or a malformed txid.
+ * @throws SparkError.InvalidResponse when the quote's signature is not hex.
+ */
+public suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt? = null, quote: DepositFeeEstimate): String {
+    if (quote.creditAmountSats <= 0) {
+        throw SparkError.InvalidArgument("the quote credits ${quote.creditAmountSats} sats; nothing to claim")
+    }
+    val quoteSignature = quote.quoteSignature.hexToBytesOrNull()?.takeIf { it.isNotEmpty() }
+        ?: throw SparkError.InvalidResponse("the SSP's quote signature is not hex")
+    val outpoint = DepositOutpoint(transactionId, staticDepositVout(transactionId, outputIndex))
+    val statement = staticDepositStatement(
+        outpoint,
+        network = config.network,
+        requestType = StaticDepositRequestType.FIXED,
+        creditAmountSats = quote.creditAmountSats.toULong(),
+        authorization = quoteSignature,
+    )
+    val signature = signer.signWithIdentityKey(sha256(statement))
     val staticSecretKey = signer.deriveStaticDepositKey(0)
-    val depositSecretKeyHex = staticSecretKey.toHexString()
-
-    val payload = java.io.ByteArrayOutputStream()
-    payload.write("claim_static_deposit".toByteArray(Charsets.UTF_8))
-    payload.write(config.network.networkGraphQL.lowercase().toByteArray(Charsets.UTF_8))
-    payload.write(transactionId.toByteArray(Charsets.UTF_8))
-    payload.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(outputIndex.toInt()).array())
-    payload.write(0) // requestType = Fixed
-    payload.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(feeEstimate.creditAmountSats).array())
-    val sigBytes = feeEstimate.quoteSignature.hexToBytesOrNull() ?: feeEstimate.quoteSignature.toByteArray(Charsets.UTF_8)
-    payload.write(sigBytes)
-
-    val payloadHash = sha256(payload.toByteArray())
-    val signature = signer.signWithIdentityKey(payloadHash)
 
     val result = sspClient.executeRaw(
         query = GraphQLMutations.CLAIM_STATIC_DEPOSIT,
         variables = mapOf(
-            "transaction_id" to transactionId,
-            "output_index" to outputIndex.toInt(),
+            "transaction_id" to outpoint.txid,
+            "output_index" to outpoint.vout.toInt(),
             "network" to config.network.networkGraphQL,
             "request_type" to "FIXED_AMOUNT",
-            "credit_amount_sats" to feeEstimate.creditAmountSats,
-            "deposit_secret_key" to depositSecretKeyHex,
+            "credit_amount_sats" to quote.creditAmountSats,
+            "deposit_secret_key" to staticSecretKey.toHexString(),
             "signature" to signature.toHexString(),
-            "quote_signature" to feeEstimate.quoteSignature,
+            "quote_signature" to quote.quoteSignature,
         ),
     )
-
-    return result.getJSONObject("claim_static_deposit").getString("transfer_id")
+    return result.optJSONObject("claim_static_deposit")?.stringOrNull("transfer_id")
+        ?: throw SparkError.InvalidResponse("No transfer_id in claim response")
 }
 
 public suspend fun SparkWallet.queryStaticDepositAddresses(): List<StaticDepositAddress> {
@@ -173,18 +252,27 @@ public suspend fun SparkWallet.getUtxosForDepositAddress(address: String, exclud
     }
 }
 
-public suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxFee: Long, outputIndex: UInt = 0u,): String? {
-    val quote = getDepositFeeEstimate(transactionId, outputIndex)
+/**
+ * Claim a static deposit, but only if the fee is at or below [maxFee] sats: the SSP's quote is
+ * checked against the deposit's value (from a transaction that hashes to the txid) and then
+ * claimed exactly, as the reference SDK does. Without [outputIndex] the output that pays this
+ * wallet's static deposit address is claimed.
+ *
+ * @return The Spark transfer id of the claim, or `null` if the fee exceeds [maxFee].
+ */
+public suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxFee: Long, outputIndex: UInt? = null): String? {
+    val depositTx = fetchDepositTransaction(transactionId)
+    val vout = staticDepositVout(transactionId, outputIndex, depositTx)
+    val outpoint = DepositOutpoint(transactionId, vout)
+    val depositSats = reportedSats(depositTx.output(vout).value)
 
-    val rawTx = fetchRawTransaction(transactionId)
-    val output = parseTxOutput(rawTx, outputIndex)
-    val totalAmount = reportedSats(output.value)
-    val fee = totalAmount - quote.creditAmountSats
-
-    if (fee > maxFee) return null
-
-    return claimStaticDeposit(transactionId, outputIndex)
+    val quote = getDepositFeeEstimate(outpoint.txid, vout)
+    if (staticDepositFee(depositSats, quote) > maxFee) return null
+    return claimStaticDeposit(outpoint.txid, vout, quote)
 }
+
+/** What the SSP keeps of a deposit under [quote]. */
+internal fun staticDepositFee(depositSats: Long, quote: DepositFeeEstimate): Long = depositSats - quote.creditAmountSats
 
 private const val INITIAL_ROOT_NODE_SEQUENCE: UInt = 0u
 private const val INITIAL_REFUND_SEQUENCE: UInt = 2000u
@@ -304,36 +392,42 @@ public suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt? = null) {
     stub.finalizeDepositTreeCreation(finalizeReq)
 }
 
+/**
+ * Refund a static deposit back on-chain. Without [outputIndex] the output that pays this wallet's
+ * static deposit address is refunded. The txid may be in any case.
+ *
+ * @param destinationAddress Bitcoin address to send the refund to (wallet's network).
+ * @param satsPerVbyte Fee rate, at most 150.
+ * @return The signed transaction hex, ready for broadcast.
+ */
 public suspend fun SparkWallet.refundStaticDeposit(
     depositTransactionId: String,
-    outputIndex: UInt = 0u,
+    outputIndex: UInt? = null,
     destinationAddress: String,
     satsPerVbyte: Long,
 ): String {
-    require(satsPerVbyte <= 150) { "satsPerVbyte must be <= 150" }
-
+    if (satsPerVbyte > 150) throw SparkError.InvalidArgument("satsPerVbyte must be <= 150")
+    // Estimated vbytes for a 1-input 1-output P2TR transaction.
     val estimatedVbytes = 194L
     val fee = satsPerVbyte * estimatedVbytes
-    require(fee >= 194) { "Fee must be at least 194 sats" }
+    if (fee < 194) throw SparkError.InvalidArgument("Fee must be at least 194 sats")
 
-    val stub = getCoordinatorStub()
-
-    // Fetch deposit tx to know the output value
-    val rawDepositTx = fetchRawTransaction(depositTransactionId)
-    val depositOutput = parseTxOutput(rawDepositTx, outputIndex)
+    // The deposit output, from a transaction that hashes to the txid.
+    val depositTx = fetchDepositTransaction(depositTransactionId)
+    val outpoint = DepositOutpoint(depositTransactionId, staticDepositVout(depositTransactionId, outputIndex, depositTx))
+    val depositOutput = depositTx.output(outpoint.vout)
     val creditAmountSats = reportedSats(depositOutput.value) - fee
-    require(creditAmountSats > 0) { "Fee too large, credit amount must be > 0" }
+    if (creditAmountSats <= 0) throw SparkError.InvalidArgument("Fee too large, credit amount must be > 0")
 
-    // Build spend tx
+    // Build spend tx: 1 input (deposit utxo), 1 output (destination)
     val spendTx = constructSpendTx(
-        depositTxId = depositTransactionId,
-        outputIndex = outputIndex,
+        spending = outpoint,
         destinationAddress = destinationAddress,
         amountSats = creditAmountSats.toULong(),
         network = config.network,
     )
 
-    // Compute sighash
+    // Compute sighash for the spend tx
     val sighash = computeMultiInputSighashUniffi(
         tx = spendTx,
         inputIndex = 0u,
@@ -341,21 +435,19 @@ public suspend fun SparkWallet.refundStaticDeposit(
         prevOutValues = listOf(depositOutput.value),
     )
 
+    val stub = getCoordinatorStub()
     val staticKey = signer.deriveStaticDepositKey(0)
     val staticPubKey = getPublicKeyBytes(staticKey, true)
-    val networkStr = config.network.networkGraphQL.lowercase()
 
-    // Build signing payload
-    val payload = java.io.ByteArrayOutputStream()
-    payload.write("claim_static_deposit".toByteArray(Charsets.UTF_8))
-    payload.write(networkStr.toByteArray(Charsets.UTF_8))
-    payload.write(depositTransactionId.toByteArray(Charsets.UTF_8))
-    payload.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(outputIndex.toInt()).array())
-    payload.write(2) // requestType = Refund
-    payload.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(creditAmountSats).array())
-    payload.write(sighash.toHexString().toByteArray(Charsets.UTF_8))
-    val payloadHash = sha256(payload.toByteArray())
-    val userSignature = signer.signWithIdentityKey(payloadHash)
+    // Authorize the refund: the statement ends with the spend transaction's raw sighash.
+    val statement = staticDepositStatement(
+        outpoint,
+        network = config.network,
+        requestType = StaticDepositRequestType.REFUND,
+        creditAmountSats = creditAmountSats.toULong(),
+        authorization = sighash,
+    )
+    val userSignature = signer.signWithIdentityKey(sha256(statement))
 
     // FROST nonce
     val keyPackage = KeyPackage(secretKey = staticKey, publicKey = staticPubKey, verifyingKey = staticPubKey)
@@ -368,15 +460,8 @@ public suspend fun SparkWallet.refundStaticDeposit(
         bindingNonce = nonceResult.commitment.binding,
     )
 
-    val txidBytes = txidBytesFromDisplayHex(depositTransactionId)
-    val utxo = Spark.UTXO.newBuilder()
-        .setTxid(ByteString.copyFrom(txidBytes))
-        .setVout(outputIndex.toInt())
-        .setNetwork(config.network.toProto())
-        .build()
-
     val refundReq = Spark.InitiateStaticDepositUtxoRefundRequest.newBuilder()
-        .setOnChainUtxo(utxo)
+        .setOnChainUtxo(outpoint.utxo(config.network.toProto()))
         .setRefundTxSigningJob(signingJob)
         .setUserSignature(ByteString.copyFrom(userSignature))
         .build()
@@ -413,13 +498,13 @@ public suspend fun SparkWallet.refundStaticDeposit(
     )
 
     // Add witness to spend tx
-    val signedTx = addWitnessToTx(spendTx, aggregatedSig)
-    return signedTx.toHexString()
+    return addWitnessToTx(spendTx, aggregatedSig).toHexString()
 }
 
+/** Refund a static deposit and broadcast it. Returns the txid. */
 public suspend fun SparkWallet.refundAndBroadcastStaticDeposit(
     depositTransactionId: String,
-    outputIndex: UInt = 0u,
+    outputIndex: UInt? = null,
     destinationAddress: String,
     satsPerVbyte: Long,
 ): String {
@@ -458,26 +543,65 @@ public suspend fun SparkWallet.broadcastTransaction(txHex: String): String {
 
 // ── Internal helpers ──
 
+/**
+ * Fetch raw transaction bytes from the block explorer. Throws [SparkError.InvalidArgument] for a
+ * txid that is not 64 hex characters, and [SparkError.InvalidResponse] for a reply that is not
+ * hex, before or instead of trusting either.
+ */
 internal suspend fun SparkWallet.fetchRawTransaction(txID: String): ByteArray {
+    val txid = DepositOutpoint.normalizedTxid(txID)
     val baseURL = when (config.network) {
         SparkNetwork.MAINNET -> "https://mempool.space/api"
         SparkNetwork.REGTEST -> "http://localhost:3000"
     }
 
     val client = okhttp3.OkHttpClient()
-    val request = okhttp3.Request.Builder().url("$baseURL/tx/$txID/hex").build()
+    val request = okhttp3.Request.Builder().url("$baseURL/tx/$txid/hex").build()
 
-    val response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-        client.newCall(request).execute()
+    val body = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw SparkError.InvalidResponse("Failed to fetch raw transaction $txid")
+            response.body?.string()
+        }
     }
+    return body?.trim()?.hexToBytesOrNull()?.takeIf { it.isNotEmpty() }
+        ?: throw SparkError.InvalidResponse("Invalid hex in raw transaction response")
+}
 
-    if (!response.isSuccessful) {
-        throw SparkError.InvalidResponse("Failed to fetch raw transaction $txID")
+/** A deposit transaction from the block explorer, checked to hash to [txid]. */
+internal suspend fun SparkWallet.fetchDepositTransaction(txid: String): RawTransaction {
+    val normalized = DepositOutpoint.normalizedTxid(txid)
+    val tx = RawTransaction.parse(fetchRawTransaction(normalized), context = "deposit tx")
+    if (tx.txidHex != normalized) {
+        throw SparkError.UntrustedResponse("block explorer returned a transaction that does not hash to $normalized")
     }
+    return tx
+}
 
-    val hexString = response.body?.string()?.trim()
-        ?: throw SparkError.InvalidResponse("Empty response for transaction $txID")
-    return hexString.hexToBytesOrNull() ?: throw SparkError.InvalidResponse("Invalid hex in raw transaction response")
+/**
+ * [outputIndex], or else the output of deposit [txid] that pays this wallet's static deposit
+ * address, as the reference SDK's `getDepositTransactionVout` finds it.
+ */
+internal suspend fun SparkWallet.staticDepositVout(txid: String, outputIndex: UInt?, transaction: RawTransaction? = null): UInt {
+    if (outputIndex != null) return outputIndex
+    val tx = transaction ?: fetchDepositTransaction(txid)
+    return staticDepositVout(tx, queryStaticDepositAddresses().map { it.address }, config.network)
+}
+
+/** The first output of [tx] paying one of [addresses]. */
+internal fun staticDepositVout(tx: RawTransaction, addresses: List<String>, network: SparkNetwork): UInt {
+    val scripts = addresses.mapNotNull {
+        try {
+            BitcoinAddress.scriptPubKey(it, network)
+        } catch (_: SparkError) {
+            null
+        }
+    }
+    val index = tx.outputs.indexOfFirst { output -> scripts.any { it.contentEquals(output.scriptPubKey) } }
+    if (index < 0) {
+        throw SparkError.InvalidArgument("transaction ${tx.txidHex} does not pay this wallet's static deposit address")
+    }
+    return index.toUInt()
 }
 
 /** Parse a display-order (big-endian hex) txid into the internal byte order used on the wire. */
@@ -487,19 +611,21 @@ internal fun txidBytesFromDisplayHex(hex: String): ByteArray {
 }
 
 /**
- * Build a simple 1-input 1-output spend transaction (version 3, witness serialisation with an
- * empty witness; the signature is attached by [addWitnessToTx]).
+ * The unsigned 1-input 1-output transaction spending a static deposit: version 3, final sequence,
+ * locktime 0, in the non-witness serialisation. The operators rebuild exactly that and compare it
+ * byte for byte (`validateStaticDepositSingleInputTx`), and the reference SDK sends
+ * `tx.toBytes()`; the signature is attached afterwards by [addWitnessToTx].
  */
-internal fun constructSpendTx(depositTxId: String, outputIndex: UInt, destinationAddress: String, amountSats: ULong, network: SparkNetwork,): ByteArray {
+internal fun constructSpendTx(spending: DepositOutpoint, destinationAddress: String, amountSats: ULong, network: SparkNetwork): ByteArray {
     val scriptPubKey = BitcoinAddress.scriptPubKey(destinationAddress, network)
     val tx = RawTransaction(
         version = 3u,
-        inputs = listOf(RawTransaction.Input(previousTxid = txidBytesFromDisplayHex(depositTxId), previousIndex = outputIndex)),
+        inputs = listOf(RawTransaction.Input(previousTxid = spending.internalOrderTxid, previousIndex = spending.vout)),
         outputs = listOf(RawTransaction.Output(value = amountSats, scriptPubKey = scriptPubKey)),
         locktime = 0u,
-        hasWitnessSerialization = true,
+        hasWitnessSerialization = false,
     )
-    return tx.serialized(includeWitness = true)
+    return tx.serialized(includeWitness = false)
 }
 
 /** Attach a single-item witness (a schnorr signature) to the first input of a segwit tx. */

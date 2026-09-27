@@ -206,16 +206,27 @@ val wallet = SparkWallet.fromSigner(
 val staticDeposit = wallet.getStaticDepositAddress()
 val utxos = wallet.getUtxosForDepositAddress(address = staticDeposit.address)
 
-// Once a UTXO confirms on-chain, claim it into your Spark balance
-val transferId = wallet.claimStaticDeposit(
+// Once a UTXO confirms on-chain, claim it into your Spark balance — only if the SSP's fee is
+// at most `maxFee` (null otherwise); the checked quote is the one claimed
+val transferId = wallet.claimStaticDepositWithMaxFee(
     transactionId = utxo.txid,
+    maxFee = 1_000,
     outputIndex = utxo.vout,
 )
+// Or check the SSP's quote yourself and claim exactly that credit
+val quote = wallet.getDepositFeeEstimate(transactionId = utxo.txid, outputIndex = utxo.vout)
+val claimId = wallet.claimStaticDeposit(transactionId = utxo.txid, outputIndex = utxo.vout, quote = quote)
 
 // One-time deposit addresses: the SDK locates the output that pays one of your unused
 // deposit addresses (pass `vout =` to insist on a specific output).
 wallet.claimDeposit(txID = txid)
 ```
+
+Deposit addresses are verified before they are returned: the operators' proof of possession,
+every operator's signature over the address (the coordinator's too for static addresses), and
+that the address pays the verifying key — `SparkError.UntrustedResponse` otherwise. Static-deposit
+calls without an `outputIndex` use the output that pays the wallet's static deposit address, and
+take txids in any case.
 
 ### Lightning
 
