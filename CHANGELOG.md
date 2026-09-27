@@ -17,6 +17,233 @@ Nothing yet.
 
 ---
 
+## [0.3.0] — 2026-09-27
+
+Brings the Kotlin SDK level with spark-swift-sdk 0.3.0 (its `ts-parity-fixes` work, which
+follows the reference TypeScript SDK). Items marked *(Kotlin only)* have no Swift counterpart.
+
+### Security
+- Token commits check the coordinator's final transaction as the reference SDK does. It must
+  carry the wallet's client timestamp (to the millisecond, which the transaction hash covers)
+  and keyshare info naming the configured operators. The keyshare checks used to be skipped when
+  the coordinator left the info out, and the timestamp was not compared.
+- A custom `sspURL` no longer sends the SSP's side of Lightning payments, leaf swaps and
+  cooperative exits to Lightspark's SSP key. The key now comes with the SSP
+  (`SparkConfig.sspIdentityPublicKeyHex`), as in the reference SDK; the default applies only to
+  the default SSP, and without one those operations throw `InvalidArgument` before any leaf moves.
+- On mainnet, operators are reached over TLS only: an `http://` operator address (or any scheme
+  but `https`) is refused with `InvalidArgument`, where it silently got a plaintext channel that
+  carried session tokens and signing material. Regtest still allows `http://` for local operators.
+- Deposit addresses are verified before they are returned, as the reference SDK does.
+  `getDepositAddress` and `getStaticDepositAddress` check the operators' BIP-340 proof of
+  possession, every operator's signature over the address (the coordinator's too for static
+  addresses) against the configured keys, and that the address pays the verifying key, and throw
+  `SparkError.UntrustedResponse` otherwise. A coordinator — or anyone impersonating it — could
+  otherwise hand out an address it alone controls, and a static address is reused for every
+  deposit.
+- `createLightningInvoice` refuses an SSP-created invoice that carries a Spark fallback — a Spark
+  identity in the sentinel route hint (`f42400f424000001`) or a Spark invoice in a version-31
+  fallback field — which the wallet never asks for; payers preferring Spark would otherwise pay
+  the SSP.
+- Integration-test secrets no longer reach the library's `BuildConfig` *(Kotlin only)*. The test
+  wallets' mnemonics and Lightning address from `local.properties` were compiled into
+  `gy.pig.spark.BuildConfig` for every variant, so an AAR built or published (for example to
+  Maven Local) on a machine with them configured carried them. JitPack builds, which have no
+  `local.properties`, did not. They now go only into the instrumented-test APK's own
+  `BuildConfig`. Delete such locally built or published AARs.
+
+### Added
+- `SparkConfig(tokenTransactionVersion = ...)` and `TokenTransactionVersion`: `V3` by default,
+  and `V2` for the older two-step flow while the operators accept it.
+- `SparkConfig(sspIdentityPublicKeyHex = ...)` and `SparkConfig.DEFAULT_SSP_URL`: the identity
+  key of a custom SSP.
+- `claimStaticDeposit(transactionId, outputIndex, quote)`: claims a static deposit for exactly
+  the credit of a quote from `getDepositFeeEstimate`, as the reference SDK's `claimStaticDeposit`
+  does.
+- `SparkEvent.Reconnecting(attempt, retryIn, reason)`, reported before each wait of the
+  self-reconnecting event stream (see Changed).
+- `SparkLeaf.isFrozen`, and `unrenewedSats` on `WithdrawAllQuote` and `WithdrawAllResult`
+  (after `frozenSats`): renewable sats a drain leaves behind because the operators did not
+  renew them.
+- Live suites ported from the Swift SDK *(tests)*: `HardeningIntegrationTests` and every suite
+  of its `IntegrationTests` (wallet, address, balance, recovery, consolidation, deposits,
+  Lightning, transfers, withdrawals, static deposits, settings, debug and ledger, funding,
+  tokens, idempotency, invoice matching, full flow). On-chain spending tests are opt-in
+  through instrumentation arguments; see `CONTRIBUTING.md`.
+
+### Changed
+- Token transactions (`transferTokens`, `burnTokens`, `mintTokens`, `createToken`) use the
+  operators' V3 format by default, as the reference SDK has since 0.5.1; the operators are moving
+  to require it. A V3 transaction is one `broadcast_transaction` call, signed over the protohash
+  of the partial transaction, which binds its inputs, outputs and amounts. Its outputs carry the
+  network's withdraw bond and locktime, and it stays valid for 180 s. The SDK checks that the
+  final transaction the operators answer with is the one it signed, and returns that
+  transaction's protohash. `SparkConfig(tokenTransactionVersion = TokenTransactionVersion.V2)`
+  keeps the two-step V2 flow. protobuf-lite has no descriptors, so the protohash of each message
+  involved is written out field by field *(Kotlin only)*; the operators' 29 cross-language
+  vectors and a test that compares the fields with `spark_token.proto` keep it exact.
+- `getTransfer(id)` and the SDK's own lookups by transfer id use the operators' by-id query
+  (`query_transfers_by_id`), as the reference SDK does since 0.9.0. It returns the whole transfer
+  and takes the id in any case.
+- The protos are re-vendored from `buildonspark/spark` at `0b3a32a` (2026-08-24). They carry the
+  event-stream heartbeat, typed leaf signatures, transfer receivers, `query_transfers_by_id`,
+  watchtower tree-node statuses and invoice statuses 5–7, and reserve the legacy
+  `InitiatePreimageSwapRequest.transfer` and `StorePreimageShareV2Request.user_signature` fields.
+  `multisig.proto` gets `java_package = "spark_multisig"` *(Kotlin only)*: protoc's Kotlin DSL
+  otherwise generates code that does not compile.
+- Static-deposit calls take `outputIndex: UInt? = null`: without an index,
+  `getDepositFeeEstimate`, `claimStaticDeposit`, `claimStaticDepositWithMaxFee` and
+  `refundStaticDeposit` use the output that pays the wallet's static deposit address, as the
+  reference SDK does, instead of output 0. Calls that pass an index are unchanged.
+- `claimStaticDeposit(transactionId, outputIndex)` is deprecated: it signs whatever credit the SSP
+  quotes. Use `claimStaticDepositWithMaxFee` or the `quote` overload.
+- **Breaking:** `subscribeToEvents()` runs until the collector stops or the wallet is closed: it
+  reconnects by itself, reporting `SparkEvent.Reconnecting` before each wait, and it claims
+  incoming payments itself (see Fixed). `close()` ends running collections normally and refuses
+  new subscriptions. *Migration:* an exhaustive `when` over `SparkEvent` must handle
+  `Reconnecting`, and a loop that resubscribed after the flow completed can simply keep
+  collecting.
+- **Breaking:** `claimPendingTransfers()` returns `PendingTransferClaim` (`claimedTransferIds`,
+  `failures` of `transferId` + `error`), the Swift SDK's type, in place of 0.2.2's
+  `SparkTransferClaim`; `claimAllPendingTransfers()` still returns the number claimed but, as in
+  Swift, no longer throws for transfers it could not claim — they are retried by the next pass.
+- **Breaking:** token parameter errors are `SparkError.TokenValidationFailed`, as in Swift, where
+  `createToken`, `mintTokens` and output selection threw `IllegalArgumentException`
+  *(Kotlin only)*.
+- `SatsBalance.owned` and `locked` follow the reference SDK: available + frozen + leaves an
+  in-flight operation still holds for the wallet (outgoing transfers, Lightning payments and
+  cooperative exits before the operators apply the sender's key tweak, swaps the wallet started
+  and their counter-transfers until claimed). Sent sats leave `owned` as soon as the transfer is
+  committed instead of when the receiver claims it, and `getBalance`/`getLeaves` query only
+  AVAILABLE nodes.
+
+### Fixed
+- `getStaticDepositAddress` asks for the static-deposit key (`m/8797555'/account'/3'/0'`) with
+  hash variant V2, as the Swift and reference SDKs do *(Kotlin only)*. Up to 0.2.2 it sent the
+  account's deposit key (`2'`), while static-deposit claims and refunds sign with the
+  static-deposit key, so deposits to an address made that way could not be claimed or refunded by
+  this SDK. The operators keep returning such an address for the wallet; it is now refused with a
+  specific `InvalidResponse` instead of being handed out. Wallets whose static address was made
+  by the Swift SDK, or by the reference SDK, are unaffected.
+- `burnTokens` pays the burn key the Swift and C# SDKs use, 33 bytes of `0x02`, not `0x02`
+  followed by 32 zero bytes *(Kotlin only)*.
+- `getTransfers()` lists only the transfers a user makes, as the reference SDK does: Spark
+  transfers, Lightning payments, cooperative exits and static deposit claims. It asked the
+  operators for every type, leaf-swap legs included, which appeared as sends and receives, and on
+  mainnet that query took up to a minute for a wallet with a long history. A lookup by `ids` still
+  returns those transfers whatever their type.
+- Token transaction hashes order invoice attachments as the operators and the reference SDK do:
+  by each invoice's id (its 16 UUID bytes), not by the invoice string. An attachment that is not
+  a Spark invoice is refused. The SDK does not attach invoices yet, so no transaction was
+  affected.
+- `transferTokens(idempotencyKey = ...)` makes a retry safe. A retry built a new transaction, but
+  the operators answer a key with the first transaction, so the SDK refused the answer ("final
+  token transaction rejected: input 0 changed") after the first transfer had gone through. The
+  wallet now remembers each key's transaction (the last 1,000 keys) and resends it unchanged. A
+  key used for another token, amount or receiver is refused with `SparkError.InvalidArgument`.
+- `createToken` checks the name and ticker as the operators and the reference SDK do: names of
+  3–20 UTF-8 bytes and tickers of 3–6, both in Unicode normalization form C. The operators refused
+  other tokens with only INTERNAL "Something went wrong."; the SDK now says which rule failed.
+- Token sends (`transferTokens`, `burnTokens`) no longer collide. A send could pick outputs of a
+  signed transaction that had not finalized (PENDING_OUTBOUND), and two concurrent sends from one
+  wallet picked the same outputs, so one failed. As in the reference SDK, a send picks only
+  AVAILABLE outputs and locks the ones it picks for 30 s, or until the operators report them
+  pending.
+- Anyone can send a wallet tokens, and unwanted ones could break its balance. Token metadata is
+  asked for 500 tokens at a time (the operators refuse more per query), and `getBalance()`'s
+  `tokenBalances` are best effort (empty on failure) so an unreadable token no longer takes the
+  sats balance with it; `getTokenBalances()` still throws the error.
+- The regtest preset (`SparkConfig(network = SparkNetwork.REGTEST)`) uses the hosted operators
+  under their keys, as the reference SDK's REGTEST preset does, instead of localhost with empty
+  identity keys.
+- SSP requests are retried as in the reference SDK: up to 5 more attempts, 1 s doubling to 10 s,
+  on HTTP 502, 503 and 504 and on a failed connection (not on a timeout or cancellation).
+- Authentication is shared and retried as in the reference SDK. Concurrent calls share one
+  authentication per operator, the auth service gets no transport retries (a retried
+  `verify_challenge` re-sends a consumed challenge), and up to 8 challenge exchanges are made: a
+  fresh challenge at once when one expired or was already used, after 250 ms on a connection
+  failure. A rejected session token is dropped only if it is still the cached one. Unlike
+  grpc-swift, grpc-java re-sends the original headers on a transport retry, so the Kotlin
+  interceptor keeps re-issuing a rejected call itself (up to 3 attempts, each on a new call); the
+  Swift crash on replaying a stream has no Kotlin counterpart.
+- The SDK keeps time by the operators' clock, estimated from the `date` and
+  `x-processing-time-ms` headers of their answers and advanced on the monotonic clock. Session
+  expiry and token-transaction timestamps used the device clock, which re-authenticated every call
+  on a device running ahead, and stamped token transactions the operators refuse.
+- Leaf renewals carry an idempotency key, the txid of the refund transaction being replaced, so a
+  transport retry of a renewal already applied no longer reports a renewed leaf as not renewed.
+- Responses over 4 MiB no longer fail: messages up to 20 MB are accepted both ways, and node
+  queries are paged at the operators' 100 per page.
+- A multi-receiver transfer can be claimed by every receiver: it is narrowed to this wallet's
+  receiver edge and leaves before it is verified and claimed, it counts as claimed once this
+  wallet's own leg is complete, and `SatsBalance.incoming` counts only this wallet's leaves of it.
+- Transfers whose leaves carry a scheme-tagged sender signature can be claimed. Signatures are
+  verified by their scheme — ECDSA in strict DER, or BIP-340 Schnorr (a new verifier on
+  BouncyCastle, checked against all of libsecp256k1's BIP-340 vectors) — and an unspecified or
+  unknown scheme is refused.
+- The event stream stays up, as the reference SDK's background stream does. Any error, or the
+  operator ending the subscription, completed the flow, and payments that arrived in the meantime
+  waited until something else claimed them. It now resubscribes forever — 1 s doubling to 15 s —
+  claims the wallet's pending transfers on every connection and reports those payments as
+  `TransferReceived`, and claims each payment that arrives while connected before reporting it.
+  Once the operators send heartbeats (every 5 s), 15 s of silence outside handling an event drops
+  the subscription and resubscribes.
+- The event stream no longer reports the counter-transfer of the wallet's own swap, or a
+  self-transfer, as a received payment, and reports a deposit once its leaf is available.
+- A transfer or leaf value of 2^63 sats or more from an operator — a `uint64` Kotlin reads as a
+  negative `Long` — or an output value that large from the block explorer is capped at the
+  bitcoin supply instead of turning into a negative amount.
+- `send(receiverSparkAddress, ...)` and `transferTokens` refuse Spark invoices with
+  `SparkError.InvalidAddress`, as the reference SDK does; addresses are decoded whole, the
+  identity key must be a valid curve point, and `transferTokens` checks the receiver before
+  fetching outputs. Paying Spark invoices is not supported yet.
+- `payLightningInvoice` offers the SSP its fee estimate as is, without a 1-sat floor, and sends
+  on the invoice it validated (trimmed and lower case; mixed case is still refused).
+- BOLT-11 invoices without a payment secret are refused, as BOLT-11 readers must.
+- A Lightning send whose preimage swap fails without a clear refusal (a connection lost after the
+  request went out, a deadline, a cancellation, an internal error) throws
+  `LightningSendIncomplete` with the transfer id; a swap the operators refused before committing
+  still throws its own error.
+- Resuming a Lightning send asks the coordinator for the send it holds under the transfer id
+  (`query_htlc`), checks that it is this wallet's HTLC to the SSP for this invoice, neither
+  returned nor expired, with at most `maxFeeSats` beyond the amount, and has the SSP pay from it.
+  The SSP answers a repeated request with the request it already has, so a send that went through
+  returns its request id instead of paying twice.
+- A Lightning send's preimage swap always carries an idempotency key — the caller's
+  `idempotencyKey`, else the transfer id.
+- SSP fee amounts are read in the unit the SSP reports (SATOSHI, MILLISATOSHI rounded up; any
+  other unit is refused).
+- Lightning preimage shares go to the operator that validates them, matched by the index in its
+  identifier rather than by the configured order.
+- Lightning receives no longer sign the preimage-share request, and Lightning sends no longer fill
+  the legacy `transfer` field of `initiate_preimage_swap_v3` (one signing round fewer); the
+  current protocol reserves both.
+- Amountless Lightning invoices can be paid: the SSP's `request_lightning_send` gets
+  `amount_sats` for them (and only for them).
+- Renewals: legacy deposit roots with a final (timelock-disabled) node sequence renew with the
+  zero-timelock variant; claimed leaves and swap outputs in the renewal range are renewed right
+  away; renewals spend the parent's output at the leaf's `vout` and pay P2TR of the leaf's
+  verifying key, as the operators rebuild them.
+- `SatsBalance.incoming` no longer counts a swap's counter-transfer and sums the leaves of every
+  page of pending transfers; `owned` and `locked` no longer grow with every node-level renewal
+  (SPLIT_LOCKED split nodes); `frozen` counts only leaves the operators will not renew (a refund
+  timelock below 100) — leaves at 100–199 are available, as every spend path renews them first.
+- Leaves whose refund timelock is not a multiple of 100 can be spent again: the next refund
+  timelock is the current one rounded down to the 100-block interval, minus 100, and a leaf is
+  spendable (`SparkLeaf.isSpendable`) when that rounded value is above 100.
+- Leaves on a zero-timelock node can be sent and claimed again: no direct refund is built for a
+  zero node, which the operators reject.
+- One pending transfer the SDK cannot claim no longer blocks the others: claims follow the
+  reference SDK's claim pass (pages of 25 until drained, claimable statuses only, failures
+  recorded and skipped) and are serialised per wallet; a transfer the operators already recorded
+  as claimed by this wallet counts as claimed.
+- Static deposits: `claimStaticDepositWithMaxFee` claims the quote it checked, against the value
+  of a transaction that hashes to the txid; `refundStaticDeposit` works (the unsigned spend is the
+  non-witness serialisation the operators rebuild, the txid goes in display order, and the refund
+  statement ends with the raw 32-byte sighash); txids are validated before any request.
+
+---
+
 ## [0.2.2] — 2026-09-26
 
 Robustness fixes from an independent review of the 0.2.1 port. The withdraw path was not
@@ -273,7 +500,8 @@ Initial public release.
   `build-frost-android.sh`. PRs that update the binaries must include a SHA-256 hash
   and the upstream commit they were built from.
 
-[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.1.0...v0.2.1
 [0.2.0]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.1.0...v0.2.1
