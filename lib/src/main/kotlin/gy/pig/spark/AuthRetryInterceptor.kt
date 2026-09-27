@@ -13,24 +13,31 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.launch
 
 /**
- * Re-authenticates and replays a call ONCE when an operator answers UNAUTHENTICATED — the
- * official Spark SDK's auth middleware behaviour ("token has expired" → drop the cached token,
- * authenticate again, re-issue the call with the new token).
+ * Keeps operator calls on a live session token, like the official SDK's auth middleware: a call
+ * the operator answers UNAUTHENTICATED is re-issued with a fresh token, up to [MAX_ATTEMPTS]
+ * attempts in all (the retry policy's count).
  *
  * [SparkAuthenticator] caches a session token until its `expiresAt`; if the operator stops
- * honouring it before then (restart, rotation, a forgotten session) the same rejected token
- * would otherwise be replayed on every call — and every call would fail — until the process
- * restarts. The operator returns `codes.Unauthenticated` for every token problem, so the status
- * code is matched rather than the message. A second rejection is returned as is.
+ * honouring it before then (restart, rotation, a forgotten session, a device clock the operator
+ * disagrees with) the same rejected token would otherwise be sent on every call — and every call
+ * would fail — until it expires. The operator returns `codes.Unauthenticated` for every token
+ * problem, and only from its pre-handler interceptors, so nothing has run server-side when a
+ * call is re-issued. The status code is matched rather than the message.
  *
- * grpc-java interceptors are callback based, unlike grpc-swift's async ones, so the replay is
- * done by [ReplayingCall]: it records what the caller sent, holds back response headers until
- * the first response message (a call that already delivered data is never replayed), refreshes
- * the token on [scope] and replays the recorded call with the new `authorization` header.
+ * grpc-java interceptors are callback based and the transport's own retries re-send the original
+ * headers, so the re-issue is done here, by [ReplayingCall]: it records what the caller sent,
+ * holds back response headers until the first response message (a call that already delivered
+ * data is never replayed), asks [refreshToken] on [scope] for a new token — handing it the
+ * rejected one, which is dropped only if it is still the cached one — and replays the recorded
+ * call on a new stream with the new `authorization` header. Unlike grpc-swift, a rejection sent
+ * after the response headers but before any message is re-issued too. Calls that carry no
+ * `authorization` header, and the token-issuing service, pass through untouched.
  *
- * @param refreshToken drops this operator's cached session and returns a fresh token.
+ * @param refreshToken drops the rejected token (when it is still the operator's cached one) and
+ *   returns the operator's current token, authenticating again if needed.
  */
-internal class AuthRetryInterceptor(private val scope: CoroutineScope, private val refreshToken: suspend () -> String) : ClientInterceptor {
+internal class AuthRetryInterceptor(private val scope: CoroutineScope, private val refreshToken: suspend (rejectedToken: String?) -> String) :
+    ClientInterceptor {
 
     override fun <ReqT, RespT> interceptCall(method: MethodDescriptor<ReqT, RespT>, callOptions: CallOptions, next: Channel): ClientCall<ReqT, RespT> {
         // The service that issues the tokens; its own calls never carry one.
@@ -53,12 +60,15 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
         private var halfClosed = false
         private var compression: Boolean? = null
         private var cancelled = false
-        private var replayed = false
+        private var attempts = 1
+
+        /** The caller sent no session token: nothing to renew, so nothing is replayed. */
+        private var passThrough = false
 
         /** The caller received a response message: from here on nothing may be replayed. */
         private var committed = false
 
-        /** Between swallowing the first UNAUTHENTICATED close and starting the replay. */
+        /** Between swallowing an UNAUTHENTICATED close and starting the replay. */
         private var refreshing = false
 
         /** `onClose` was delivered to the caller. */
@@ -69,6 +79,7 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
                 listener = responseListener
                 // Snapshot: the transport may add its own entries to the Metadata it is given.
                 this.headers = Metadata().apply { merge(headers) }
+                passThrough = !headers.containsKey(SparkAuthenticator.AUTHORIZATION_KEY)
                 attempt.start(AttemptListener(), headers)
             }
         }
@@ -136,6 +147,7 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
                     val replayHeaders = Metadata().apply { merge(original) }
                     replayHeaders.removeAll(SparkAuthenticator.AUTHORIZATION_KEY)
                     replayHeaders.put(SparkAuthenticator.AUTHORIZATION_KEY, "Bearer $token")
+                    headers = Metadata().apply { merge(replayHeaders) }
                     val call = next.newCall(method, callOptions)
                     attempt = call
                     call.start(AttemptListener(), replayHeaders)
@@ -181,11 +193,17 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
             }
 
             override fun onClose(status: Status, trailers: Metadata) {
+                var rejectedToken: String? = null
                 val shouldReplay = synchronized(lock) {
-                    val replay = status.code == Status.Code.UNAUTHENTICATED && !committed && !replayed && !cancelled
+                    val replay = status.code == Status.Code.UNAUTHENTICATED &&
+                        !committed &&
+                        !passThrough &&
+                        attempts < MAX_ATTEMPTS &&
+                        !cancelled
                     if (replay) {
-                        replayed = true
+                        attempts++
                         refreshing = true
+                        rejectedToken = headers?.get(SparkAuthenticator.AUTHORIZATION_KEY)?.removePrefix("Bearer ")
                     }
                     replay
                 }
@@ -201,7 +219,7 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
                 scope.launch(start = CoroutineStart.ATOMIC) {
                     var failure: Throwable? = null
                     val token = try {
-                        refreshToken()
+                        refreshToken(rejectedToken)
                     } catch (e: Throwable) {
                         // Includes cancellation: the call must still be closed below.
                         failure = e
@@ -216,5 +234,8 @@ internal class AuthRetryInterceptor(private val scope: CoroutineScope, private v
     companion object {
         /** The service that issues the tokens; exempt from the retry. */
         const val AUTHN_SERVICE: String = "spark_authn.SparkAuthnService"
+
+        /** Attempts of a call the operator keeps rejecting: the transport retry policy's `maxAttempts`. */
+        const val MAX_ATTEMPTS: Int = 3
     }
 }

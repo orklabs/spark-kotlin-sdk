@@ -91,7 +91,7 @@ private data class LeafSigningInfo(
 internal suspend fun SparkWallet.processSwapBatch(leaves: List<SparkLeaf>, targetAmounts: List<Long>,): List<SparkLeaf> {
     val stub = getCoordinatorStub()
     val networkStr = config.network.networkString
-    val receiverPubKey = config.sspIdentityPublicKey
+    val receiverPubKey = config.requireSspIdentityPublicKey()
 
     val soListResponse = stub.getSigningOperatorList(Empty.getDefaultInstance())
     val soOperators = soListResponse.signingOperatorsMap

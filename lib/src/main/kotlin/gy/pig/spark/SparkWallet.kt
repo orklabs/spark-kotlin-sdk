@@ -46,21 +46,31 @@ import spark_token.SparkTokenServiceGrpcKt
  * @see SparkError
  */
 public class SparkWallet private constructor(public val config: SparkConfig, public val signer: SparkSignerProtocol,) {
-    internal val authenticator = SparkAuthenticator()
+    /** The operators' clock, estimated from their answers (see [ServerClock]). */
+    internal val serverClock = ServerClock()
 
     /**
-     * Runs the token refreshes of [AuthRetryInterceptor]. Never cancelled: [close] only drops
-     * the connections, and the wallet stays usable afterwards.
+     * Runs the authentications callers share and the token refreshes of [AuthRetryInterceptor].
+     * Never cancelled: [close] only drops the connections, and the wallet stays usable afterwards.
      */
     private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // Every operator channel re-authenticates and replays a call once on UNAUTHENTICATED (the
-    // official SDK's auth middleware), so a token the server stopped honouring is replaced on the
-    // spot rather than replayed until the process restarts.
-    internal val connectionManager: GrpcConnectionManager = GrpcConnectionManager(config.signingOperatorAddresses) { address ->
+    internal val authenticator = SparkAuthenticator(serverClock, transportScope)
+
+    // Every operator channel re-issues a call the operator rejects as UNAUTHENTICATED with a fresh
+    // token (the official SDK's auth middleware), dropping the rejected token only if it is still
+    // the cached one; the innermost interceptor feeds the operators' clock from their answers.
+    internal val connectionManager: GrpcConnectionManager = GrpcConnectionManager(
+        addresses = config.signingOperatorAddresses,
+        // Operator traffic carries session tokens and signing material: TLS on mainnet.
+        allowsPlaintext = config.network != SparkNetwork.MAINNET,
+    ) { address ->
+        // grpc-java calls the last interceptor first: authentication outermost, the clock innermost,
+        // so the clock measures only the operator's round trip.
         listOf(
-            AuthRetryInterceptor(transportScope) {
-                authenticator.invalidate(address, signer)
+            ServerTimeInterceptor(serverClock),
+            AuthRetryInterceptor(transportScope) { rejectedToken ->
+                if (rejectedToken != null) authenticator.invalidate(address, signer, rejectedToken)
                 authenticator.getToken(this.connectionManager, address, signer)
             },
         )

@@ -2,6 +2,7 @@ package gy.pig.spark
 
 import com.google.protobuf.ByteString
 import spark.Spark
+import spark.SparkServiceGrpcKt
 
 /**
  * Compute the wallet's full sats balance.
@@ -40,8 +41,7 @@ public suspend fun SparkWallet.getBalance(): WalletBalance {
         .setNetwork(config.network.toProto())
         .build()
 
-    val nodesResponse = stub.queryNodes(nodesRequest)
-    val summary = summarizeNodes(nodesResponse.nodesMap)
+    val summary = summarizeNodes(queryAllNodes(nodesRequest, stub))
 
     // Incoming: pending inbound transfers + deposits still being created
     // (matches TS SDK which tracks CREATING deposit nodes as incoming).
@@ -96,16 +96,12 @@ internal fun summarizeNodes(nodes: Map<String, Spark.TreeNode>): NodeSummary {
  * `false`). Spend paths select from [getSpendableLeaves] instead.
  */
 public suspend fun SparkWallet.getLeaves(): List<SparkLeaf> {
-    val stub = getCoordinatorStub()
-
     val request = Spark.QueryNodesRequest.newBuilder()
         .setOwnerIdentityPubkey(ByteString.copyFrom(signer.identityPublicKey))
         .setNetwork(config.network.toProto())
         .build()
 
-    val response = stub.queryNodes(request)
-
-    return response.nodesMap.mapNotNull { (id, node) ->
+    return queryAllNodes(request).mapNotNull { (id, node) ->
         if (node.status.toString() != "AVAILABLE") return@mapNotNull null
         SparkLeaf(
             id = id,
@@ -114,6 +110,34 @@ public suspend fun SparkWallet.getLeaves(): List<SparkLeaf> {
             status = node.status.toString(),
             node = node,
         )
+    }
+}
+
+/** Nodes per `query_nodes` page: the operators' maximum. */
+internal const val NODE_PAGE_SIZE: Long = 100
+
+/**
+ * Nodes the operators return for [request], a page of [NODE_PAGE_SIZE] at a time (their
+ * maximum), as the reference SDK pages them: without a limit the whole set comes back in one
+ * response, which outgrows the message-size limit for a wallet with many leaves. Pages are
+ * counted here rather than following the response's offset (proto3 cannot tell "0" from unset);
+ * with `include_parents` the parents pad the pages, which costs at most one extra request.
+ */
+internal suspend fun SparkWallet.queryAllNodes(
+    request: Spark.QueryNodesRequest,
+    stub: SparkServiceGrpcKt.SparkServiceCoroutineStub? = null,
+): Map<String, Spark.TreeNode> {
+    val client = stub ?: getCoordinatorStub()
+    val nodes = LinkedHashMap<String, Spark.TreeNode>()
+    var offset = 0L
+    while (true) {
+        val response = client.queryNodes(request.toBuilder().setLimit(NODE_PAGE_SIZE).setOffset(offset).build())
+        val countBefore = nodes.size
+        nodes.putAll(response.nodesMap)
+        // A short page ends the set; a page that adds nothing means the operator is not paging,
+        // and asking again would never end.
+        if (response.nodesCount < NODE_PAGE_SIZE || nodes.size <= countBefore) return nodes
+        offset += NODE_PAGE_SIZE
     }
 }
 

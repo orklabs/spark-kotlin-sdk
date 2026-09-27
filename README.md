@@ -354,13 +354,16 @@ val transfers = wallet.getTransfers(
 
 ```kotlin
 val mainnet = SparkConfig(network = SparkNetwork.MAINNET)
+// Regtest on the hosted operators and SSP. One-time deposit claims and static-deposit refunds
+// fetch transactions from a local explorer at http://localhost:3000.
 val regtest = SparkConfig(network = SparkNetwork.REGTEST)
 
-// Custom operators / SSP
+// Custom operators / SSP: a custom SSP needs its identity key too
 val custom = SparkConfig(
     network = SparkNetwork.MAINNET,
-    signingOperators = listOf(/* SigningOperatorConfig(...) */),
-    sspURL = "https://api.lightspark.com/graphql/spark/2025-03-19",
+    signingOperators = listOf(/* SigningOperatorConfig(...), https:// only on mainnet */),
+    sspURL = "https://ssp.example/graphql",
+    sspIdentityPublicKeyHex = "02...",
 )
 ```
 

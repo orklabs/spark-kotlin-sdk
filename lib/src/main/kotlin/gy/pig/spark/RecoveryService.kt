@@ -61,15 +61,12 @@ public suspend fun SparkWallet.getRecoverySnapshot(): SparkRecoverySnapshot {
         .withMaxInboundMessageSize(RECOVERY_MAX_MESSAGE_BYTES)
         .withMaxOutboundMessageSize(RECOVERY_MAX_MESSAGE_BYTES)
 
-    val all = mutableMapOf<String, Spark.TreeNode>()
-
     val request = Spark.QueryNodesRequest.newBuilder()
         .setOwnerIdentityPubkey(ByteString.copyFrom(signer.identityPublicKey))
         .setIncludeParents(true)
         .setNetwork(config.network.toProto())
         .build()
-    val response = stub.queryNodes(request)
-    all.putAll(response.nodesMap)
+    val all = queryAllNodes(request, stub).toMutableMap()
 
     // Repair pass: fetch any parent referenced by a node in the map but not present
     // in it. Bounded so a coordinator that keeps returning nothing can't loop us

@@ -22,16 +22,15 @@ public suspend fun SparkWallet.getWithdrawalFeeEstimate(onChainAddress: String, 
 }
 
 /**
- * The SSP's fast-exit fee in sats: its user fee plus the L1 broadcast fee. Both must be whole,
- * non-negative numbers, and a sum that would overflow is refused instead of wrapping.
+ * The SSP's fast-exit fee in sats: its user fee plus the L1 broadcast fee, each in the unit the
+ * SSP reports it in (see [SspCurrencyAmount]). A sum that would overflow is refused instead of
+ * wrapping.
  */
 internal fun withdrawalFeeEstimateSats(response: JSONObject): Long {
     val fast = response.optJSONObject("coop_exit_fee_estimates")?.optJSONObject("speed_fast")
-    val userFee = fast?.optJSONObject("user_fee")?.let { wholeNonNegativeLong(it.opt("original_value")) }
-    val l1Fee = fast?.optJSONObject("l1_broadcast_fee")?.let { wholeNonNegativeLong(it.opt("original_value")) }
-    if (userFee == null || l1Fee == null) {
-        throw SparkError.InvalidResponse("Invalid fee estimate response")
-    }
+        ?: throw SparkError.InvalidResponse("Invalid fee estimate response")
+    val userFee = SspCurrencyAmount.sats(fast.optJSONObject("user_fee"), field = "cooperative exit user fee")
+    val l1Fee = SspCurrencyAmount.sats(fast.optJSONObject("l1_broadcast_fee"), field = "cooperative exit broadcast fee")
     return try {
         Math.addExact(userFee, l1Fee)
     } catch (_: ArithmeticException) {
@@ -178,7 +177,7 @@ private class CoopExitRefundJobs(
  */
 private suspend fun SparkWallet.performCooperativeExit(leaves: List<SparkLeaf>, amountSats: Long, feeCap: Long, onChainAddress: String,): CooperativeExit {
     val stub = getCoordinatorStub()
-    val receiverPubKey = config.sspIdentityPublicKey
+    val receiverPubKey = config.requireSspIdentityPublicKey()
 
     // Step 1: Request coop exit from SSP — get the exit and connector transactions
     val transferID = UUID.randomUUID().toString().lowercase()

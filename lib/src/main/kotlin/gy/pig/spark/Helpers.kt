@@ -3,6 +3,9 @@
 package gy.pig.spark
 
 import android.util.Base64
+import io.grpc.Status
+import io.grpc.StatusException
+import io.grpc.StatusRuntimeException
 import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import java.math.BigDecimal
@@ -22,6 +25,14 @@ internal fun String.hexToByteArray(): ByteArray {
 }
 
 internal fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
+
+/** The gRPC status of a failed call, in whichever form grpc-kotlin or grpc-java raised it; `null` for any other error. */
+internal val Throwable.grpcStatus: Status?
+    get() = when (this) {
+        is StatusException -> status
+        is StatusRuntimeException -> status
+        else -> null
+    }
 
 /**
  * Strict hex decoding: `null` for an odd length or any non-hex character (Swift's

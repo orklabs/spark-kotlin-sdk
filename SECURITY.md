@@ -68,7 +68,8 @@ Out of scope:
   [Android Keystore system](https://developer.android.com/training/articles/keystore)
   with `setUserAuthenticationRequired(true)` for production wallets.
 - **Network transport** is gRPC over HTTP/2 + TLS to Spark operators and HTTPS
-  (OkHttp) to the SSP. The SDK does **not** implement certificate pinning by default
+  (OkHttp) to the SSP; on mainnet the SDK refuses an operator address that is not
+  `https://`. The SDK does **not** implement certificate pinning by default
   — apps that require it should configure an OkHttp `CertificatePinner` and pass a
   custom `OkHttpClient` through their `SparkSigner` setup, or fork the SDK to pin
   the gRPC channel. The response verification described below is what limits the

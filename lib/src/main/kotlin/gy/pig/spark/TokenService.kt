@@ -613,8 +613,12 @@ internal suspend fun SparkWallet.fetchTokenMetadata(tokenIdentifiers: List<ByteA
 
 // MARK: - Internal: Helpers
 
-private fun currentTimestamp(): Timestamp {
-    val now = System.currentTimeMillis()
+/**
+ * Now on the operators' clock: they refuse a client timestamp outside the transaction's validity
+ * window measured on theirs (the reference SDK stamps server time too).
+ */
+private fun SparkWallet.currentTimestamp(): Timestamp {
+    val now = serverClock.nowMillis()
     val seconds = now / 1000
     val nanos = ((now % 1000) * 1_000_000).toInt()
     // Truncate nanos to microsecond precision (matching Swift)

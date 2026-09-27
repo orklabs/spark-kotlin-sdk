@@ -26,8 +26,9 @@ import java.io.InputStream
  * Pins the transport behaviour that stops a wedged connection or a rejected session token from
  * parking every call until the host process restarts — the values mirror the official Spark
  * SDK's connection manager (60 s unary cap; 3 attempts, 1 s → 10 s backoff on UNAVAILABLE and
- * CANCELLED; re-authenticate and replay once on an expired token). Ported from the Swift SDK's
- * `TransportHardeningTests.swift`, plus behaviour tests for the grpc-java replay mechanics.
+ * CANCELLED; re-authenticate and re-issue a call rejected as UNAUTHENTICATED; 20 MB messages;
+ * the operators' clock; SSP retries). Ported from the Swift SDK's `TransportHardeningTests.swift`,
+ * plus behaviour tests for the grpc-java replay mechanics.
  */
 class TransportHardeningTests {
 
@@ -43,6 +44,7 @@ class TransportHardeningTests {
         assertEquals(60L, GrpcConnectionManager.DEFAULT_RPC_TIMEOUT_SECONDS)
     }
 
+    /** UNAUTHENTICATED is re-issued by [AuthRetryInterceptor], with a fresh token, not by the transport. */
     @Test
     fun everyRpcRetriesLikeTheOfficialSdk() {
         @Suppress("UNCHECKED_CAST")
@@ -53,6 +55,44 @@ class TransportHardeningTests {
         assertEquals(2.0, policy["backoffMultiplier"])
         assertEquals(listOf("UNAVAILABLE", "CANCELLED"), policy["retryableStatusCodes"])
         assertFalse((policy["retryableStatusCodes"] as List<*>).contains("DEADLINE_EXCEEDED"))
+    }
+
+    @Test
+    fun messagesUpToTheReferenceSdks20MbAreSentAndReceivedTheEventStreamIncluded() {
+        val stream = methodConfigs.firstOrNull {
+            it["name"] == listOf(mapOf("service" to "spark.SparkService", "method" to "subscribe_to_events"))
+        }
+        assertEquals(20 * 1024 * 1024, GrpcConnectionManager.MAX_MESSAGE_BYTES)
+        for (config in listOf(global, stream)) {
+            assertEquals(GrpcConnectionManager.MAX_MESSAGE_BYTES.toDouble(), config?.get("maxRequestMessageBytes"))
+            assertEquals(GrpcConnectionManager.MAX_MESSAGE_BYTES.toDouble(), config?.get("maxResponseMessageBytes"))
+        }
+    }
+
+    private fun availableNode(index: Int, payload: Int = 0): spark.Spark.TreeNode = spark.Spark.TreeNode.newBuilder()
+        .setId("node-%04d".format(index))
+        .setStatus("AVAILABLE")
+        .setValue(1)
+        .setNodeTx(bytes(0xAB, payload).toByteString())
+        .build()
+
+    @Test(timeout = 60_000)
+    fun aWalletsNodesAreReadAPageOf100AtATimeUntilAShortPage() = runBlocking {
+        val state = FakeOperatorState { false }
+        state.setNodes((0 until 250).map { availableNode(it) })
+        val leaves = withFakeOperator(state) { it.getLeaves() }
+        assertEquals(250, leaves.size)
+        assertEquals(listOf(listOf(100L, 0L), listOf(100L, 100L), listOf(100L, 200L)), state.nodePages)
+    }
+
+    @Test(timeout = 60_000)
+    fun aPageLargerThanGrpcs4MibDefaultIsReceived() = runBlocking {
+        val state = FakeOperatorState { false }
+        // 100 nodes of 50 kB: one 5 MB page, then an empty one.
+        state.setNodes((0 until 100).map { availableNode(it, payload = 50_000) })
+        val leaves = withFakeOperator(state) { it.getLeaves() }
+        assertEquals(100, leaves.size)
+        assertEquals(listOf(listOf(100L, 0L), listOf(100L, 100L)), state.nodePages)
     }
 
     @Test
@@ -74,7 +114,7 @@ class TransportHardeningTests {
     fun grpcJavaAcceptsTheServiceConfigWhenAChannelIsBuilt() = runBlocking {
         // No connection is made: channels connect lazily. Building parses the default service
         // config, so a config grpc-java cannot read fails here instead of on the first call.
-        val manager = GrpcConnectionManager(listOf("http://localhost:1"))
+        val manager = GrpcConnectionManager(listOf("http://localhost:1"), allowsPlaintext = true)
         manager.getChannel("http://localhost:1")
         manager.close()
 
@@ -87,7 +127,7 @@ class TransportHardeningTests {
     }
 
     @Test
-    fun theAuthInterceptorLeavesTheTokenIssuingServiceAlone() {
+    fun theAuthInterceptorLeavesTheTokenIssuingServiceAloneAndTheTransportNeverRetriesIt() {
         assertEquals("spark_authn.SparkAuthnService", AuthRetryInterceptor.AUTHN_SERVICE)
         assertEquals(spark_authn.SparkAuthnServiceGrpc.SERVICE_NAME, AuthRetryInterceptor.AUTHN_SERVICE)
 
@@ -95,6 +135,183 @@ class TransportHardeningTests {
         val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) { error("must not refresh") }
         val call = interceptor.interceptCall(method("spark_authn.SparkAuthnService/get_challenge"), CallOptions.DEFAULT, channel)
         assertSame(channel.calls.single(), call)
+
+        val authn = methodConfigs.firstOrNull { it["name"] == listOf(mapOf("service" to "spark_authn.SparkAuthnService")) }
+        assertNotNull(authn)
+        assertNull(authn!!["retryPolicy"])
+        assertEquals("${GrpcConnectionManager.DEFAULT_RPC_TIMEOUT_SECONDS}s", authn["timeout"])
+    }
+
+    @Test
+    fun sspAmountsAreReadInTheirReportedUnitOtherUnitsAreRefused() {
+        fun amount(value: Any?, unit: String?): org.json.JSONObject = org.json.JSONObject().apply {
+            put("original_value", value)
+            if (unit != null) put("original_unit", unit)
+        }
+        // As the SSP's JSON arrives.
+        assertEquals(2L, SspCurrencyAmount.sats(org.json.JSONObject("""{"original_value": 2000, "original_unit": "MILLISATOSHI"}"""), "fee"))
+        assertEquals(2L, SspCurrencyAmount.sats(amount(2L, "SATOSHI"), "fee"))
+        assertEquals(3L, SspCurrencyAmount.sats(amount(2001L, "MILLISATOSHI"), "fee"))
+        assertEquals(0L, SspCurrencyAmount.sats(amount(0L, "MILLISATOSHI"), "fee"))
+        // Long.MAX_VALUE msat rounds up without overflowing.
+        assertEquals(Long.MAX_VALUE / 1000 + 1, SspCurrencyAmount.sats(amount(Long.MAX_VALUE, "MILLISATOSHI"), "fee"))
+        for (bad in listOf(amount(1L, "BITCOIN"), amount(1L, "USD"), amount(1L, null), amount(-1L, "SATOSHI"), amount("12", "SATOSHI"))) {
+            expectSparkError(bad.toString()) { SspCurrencyAmount.sats(bad, "fee") }
+        }
+        expectSparkError { SspCurrencyAmount.sats(null, "fee") }
+        assertTrue(GraphQLQueries.LIGHTNING_SEND_FEE_ESTIMATE.contains("original_unit"))
+    }
+
+    private fun reply(status: Int): okhttp3.Response = okhttp3.Response.Builder()
+        .request(okhttp3.Request.Builder().url("https://ssp.example/graphql").build())
+        .protocol(okhttp3.Protocol.HTTP_1_1)
+        .code(status)
+        .message("")
+        .body(okhttp3.ResponseBody.Companion.create(null, ""))
+        .build()
+
+    @Test
+    fun sspRequestsAreRetriedLikeTheReferenceSdks() = runBlocking {
+        assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 10_000L, 10_000L, 10_000L), (0..6).map { SspRetry.STANDARD.delayMs(it) })
+        val instant = SspRetry(maxRetries = 5, baseDelayMs = 0, maxDelayMs = 0)
+
+        var attempts = 0
+        var response = instant.run {
+            attempts++
+            reply(if (attempts < 3) listOf(503, 502)[attempts - 1] else 200)
+        }
+        assertEquals(3, attempts)
+        assertEquals(200, response.code)
+
+        attempts = 0
+        response = instant.run {
+            attempts++
+            if (attempts == 1) throw java.net.SocketException("Connection reset")
+            reply(200)
+        }
+        assertEquals(2, attempts)
+
+        attempts = 0
+        instant.run {
+            attempts++
+            if (attempts == 1) throw java.net.UnknownHostException("ssp.example")
+            reply(200)
+        }
+        assertEquals(2, attempts)
+
+        // Out of retries, the last answer stands; other statuses, timeouts and bad certificates are not retried.
+        attempts = 0
+        response = instant.run {
+            attempts++
+            reply(504)
+        }
+        assertEquals(6, attempts)
+        assertEquals(504, response.code)
+        attempts = 0
+        instant.run {
+            attempts++
+            reply(500)
+        }
+        assertEquals(1, attempts)
+        attempts = 0
+        assertThrows(java.net.SocketTimeoutException::class.java) {
+            runBlocking {
+                instant.run {
+                    attempts++
+                    throw java.net.SocketTimeoutException("timeout")
+                }
+            }
+        }
+        assertEquals(1, attempts)
+        attempts = 0
+        assertThrows(javax.net.ssl.SSLPeerUnverifiedException::class.java) {
+            runBlocking {
+                instant.run {
+                    attempts++
+                    throw javax.net.ssl.SSLPeerUnverifiedException("hostname mismatch")
+                }
+            }
+        }
+        assertEquals(1, attempts)
+    }
+
+    @Test
+    fun operatorsAreReachedOverTlsPlaintextOnlyWhereAllowedNeverOnMainnetOtherSchemesNever() = runBlocking {
+        val mainnet = GrpcConnectionManager(addresses = emptyList())
+        assertTrue(runCatching { mainnet.getChannel("http://operator.example") }.exceptionOrNull() is SparkError.InvalidArgument)
+        mainnet.getChannel("https://operator.example")
+        val regtest = GrpcConnectionManager(addresses = emptyList(), allowsPlaintext = true)
+        regtest.getChannel("http://127.0.0.1:9001")
+        assertTrue(runCatching { regtest.getChannel("ftp://operator.example") }.exceptionOrNull() is SparkError.InvalidArgument)
+        mainnet.close()
+        regtest.close()
+    }
+
+    @Test
+    fun theSspIdentityKeyFollowsTheSsp() {
+        assertEquals("023e33e2920326f64ea31058d44777442d97d7d5cbfcf54e3060bc1695e5261c93", SparkConfig().sspIdentityPublicKey.toHexString())
+        assertEquals(
+            "022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe",
+            SparkConfig(network = SparkNetwork.REGTEST).sspIdentityPublicKey.toHexString(),
+        )
+        assertTrue(SparkConfig(sspURL = SparkConfig.DEFAULT_SSP_URL).sspIdentityPublicKey.contentEquals(SparkConfig().sspIdentityPublicKey))
+
+        // A custom SSP without its key: no key, and transfers to the SSP refuse to run.
+        val custom = SparkConfig(sspURL = "https://ssp.example/graphql")
+        assertTrue(custom.sspIdentityPublicKey.isEmpty())
+        expectSparkError { custom.requireSspIdentityPublicKey() }
+
+        val key = "03" + "ab".repeat(32)
+        val configured = SparkConfig(sspURL = "https://ssp.example/graphql", sspIdentityPublicKeyHex = key)
+        assertEquals(key, configured.requireSspIdentityPublicKey().toHexString())
+        expectSparkError { SparkConfig(sspIdentityPublicKeyHex = "zz").requireSspIdentityPublicKey() }
+        expectSparkError { SparkConfig(sspIdentityPublicKeyHex = "04" + "ab".repeat(32)).requireSspIdentityPublicKey() }
+    }
+
+    @Test
+    fun theRegtestPresetUsesTheHostedOperatorsAndKeys() {
+        val regtest = SparkConfig(network = SparkNetwork.REGTEST)
+        val mainnet = SparkConfig()
+        assertEquals(mainnet.signingOperators.map { it.address }, regtest.signingOperators.map { it.address })
+        assertEquals(mainnet.signingOperators.map { it.identityPublicKeyHex }, regtest.signingOperators.map { it.identityPublicKeyHex })
+        assertTrue(regtest.signingOperators.all { it.address.startsWith("https://") && it.identityPublicKeyHex.length == 66 })
+        assertEquals(2u, regtest.signingThreshold)
+    }
+
+    @Test
+    fun theOperatorsClockIsEstimatedFromTheirDateAndProcessingTimeHeaders() {
+        var monotonic = 5_000_000_000L
+        val clock = ServerClock { monotonic }
+        assertFalse(clock.isSynced)
+        assertTrue(kotlin.math.abs(clock.nowMillis() - System.currentTimeMillis()) < 1_000)
+        // Garbage headers are ignored.
+        clock.record("yesterday", "1", monotonic, monotonic)
+        clock.record("Mon, 02 Jan 2006 15:04:05 UTC", "-5", monotonic, monotonic)
+        clock.record("Mon, 02 Jan 2006 15:04:05 UTC trailing", "1", monotonic, monotonic)
+        assertFalse(clock.isSynced)
+
+        // Answered 200 ms after sending, 100 ms of it processing: 50 ms each way.
+        clock.record("Mon, 02 Jan 2006 15:04:05 UTC", "100", sentNanos = monotonic - 200_000_000, receivedNanos = monotonic)
+        assertTrue(clock.isSynced)
+        val stated = ServerClock.parseDate("Mon, 02 Jan 2006 15:04:05 UTC")!!
+        assertEquals(1_136_214_245_000L, stated.time)
+        assertEquals(stated.time + 50, clock.nowMillis())
+        // Then it advances on the monotonic clock, whatever the device clock does.
+        monotonic += 1_500_000_000
+        assertEquals(stated.time + 1_550, clock.nowMillis())
+        assertEquals("Mon, 02 Jan 2006 15:04:05 UTC", ServerClock.formatDate(stated))
+    }
+
+    @Test(timeout = 60_000)
+    fun sessionTokensAreKeptByTheOperatorsClockADeviceClockTwoHoursAheadDoesNotReauthenticateEveryCall() = runBlocking {
+        val state = FakeOperatorState { false }
+        state.clockOffsetMillis = -2 * 3_600_000L
+        withFakeOperator(state) { wallet ->
+            repeat(3) { wallet.getLeaves() }
+            assertTrue(wallet.serverClock.isSynced)
+            assertTrue(kotlin.math.abs(wallet.serverClock.nowMillis() - System.currentTimeMillis() + 2 * 3_600_000L) < 5_000)
+        }
+        assertEquals(listOf("session-1"), state.issuedTokens)
     }
 
     @Test
@@ -110,17 +327,19 @@ class TransportHardeningTests {
 
     // ── AuthRetryInterceptor mechanics ──────────────────────────────────────
 
+    private fun authorized(token: String = "stale"): Metadata = Metadata().apply { put(SparkAuthenticator.AUTHORIZATION_KEY, "Bearer $token") }
+
     @Test
-    fun anUnauthenticatedCallIsReplayedOnceWithAFreshToken() {
+    fun anUnauthenticatedCallIsReplayedWithAFreshTokenAndTheRejectedOneIsNamed() {
         val channel = FakeChannel()
-        var refreshes = 0
+        val rejected = mutableListOf<String?>()
         val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) {
-            refreshes++
+            rejected.add(it)
             "fresh"
         }
         val listener = RecordingListener()
         val call = interceptor.interceptCall(method(), CallOptions.DEFAULT, channel)
-        call.start(listener, Metadata().apply { put(SparkAuthenticator.AUTHORIZATION_KEY, "Bearer stale") })
+        call.start(listener, authorized())
         call.request(2)
         call.sendMessage("request")
         call.halfClose()
@@ -131,7 +350,7 @@ class TransportHardeningTests {
         first.listener.onClose(Status.UNAUTHENTICATED.withDescription("token has expired"), Metadata())
 
         // The failed attempt is invisible to the caller; the replay carries the new token only.
-        assertEquals(1, refreshes)
+        assertEquals(listOf<String?>("stale"), rejected)
         assertTrue(listener.events.isEmpty())
         val second = channel.calls[1]
         assertEquals(listOf("Bearer fresh"), second.headers.getAll(SparkAuthenticator.AUTHORIZATION_KEY)?.toList())
@@ -146,23 +365,35 @@ class TransportHardeningTests {
     }
 
     @Test
-    fun aSecondRejectionIsReturnedAsIs() {
+    fun aRejectionOnTheLastAttemptIsReturnedAsIs() {
         val channel = FakeChannel()
+        val rejected = mutableListOf<String?>()
         var refreshes = 0
         val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) {
-            refreshes++
-            "fresh"
+            rejected.add(it)
+            "fresh-${++refreshes}"
         }
         val listener = RecordingListener()
         val call = interceptor.interceptCall(method(), CallOptions.DEFAULT, channel)
-        call.start(listener, Metadata())
+        call.start(listener, authorized())
         call.sendMessage("request")
         call.halfClose()
-        channel.calls[0].listener.onClose(Status.UNAUTHENTICATED, Metadata())
-        channel.calls[1].listener.onClose(Status.UNAUTHENTICATED, Metadata())
-        assertEquals(1, refreshes)
-        assertEquals(2, channel.calls.size)
+        repeat(AuthRetryInterceptor.MAX_ATTEMPTS) { channel.calls[it].listener.onClose(Status.UNAUTHENTICATED, Metadata()) }
+        // Each refresh names the token that attempt was rejected with.
+        assertEquals(listOf<String?>("stale", "fresh-1"), rejected)
+        assertEquals(AuthRetryInterceptor.MAX_ATTEMPTS, channel.calls.size)
         assertEquals(listOf("close:UNAUTHENTICATED"), listener.events)
+    }
+
+    @Test
+    fun aCallWithoutASessionTokenIsNeverReplayed() {
+        val channel = FakeChannel()
+        val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) { error("must not refresh") }
+        val listener = RecordingListener()
+        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(listener, Metadata())
+        channel.calls.single().listener.onClose(Status.UNAUTHENTICATED, Metadata())
+        assertEquals(listOf("close:UNAUTHENTICATED"), listener.events)
+        assertEquals(1, channel.calls.size)
     }
 
     @Test
@@ -171,12 +402,12 @@ class TransportHardeningTests {
         val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) { error("must not refresh") }
 
         val unavailable = RecordingListener()
-        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(unavailable, Metadata())
+        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(unavailable, authorized())
         channel.calls.last().listener.onClose(Status.UNAVAILABLE, Metadata())
         assertEquals(listOf("close:UNAVAILABLE"), unavailable.events)
 
         val stream = RecordingListener()
-        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(stream, Metadata())
+        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(stream, authorized())
         val attempt = channel.calls.last()
         attempt.listener.onHeaders(Metadata())
         attempt.listener.onMessage("event")
@@ -192,7 +423,7 @@ class TransportHardeningTests {
             throw SparkError.AuthenticationFailed("operator unreachable")
         }
         val listener = RecordingListener()
-        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(listener, Metadata())
+        interceptor.interceptCall(method(), CallOptions.DEFAULT, channel).start(listener, authorized())
         channel.calls.single().listener.onClose(Status.UNAUTHENTICATED, Metadata())
         assertEquals(listOf("close:UNAUTHENTICATED"), listener.events)
         assertTrue(listener.closeStatus?.cause is SparkError.AuthenticationFailed)
@@ -206,7 +437,7 @@ class TransportHardeningTests {
         val interceptor = AuthRetryInterceptor(CoroutineScope(Dispatchers.Unconfined)) { token.await() }
         val listener = RecordingListener()
         val call = interceptor.interceptCall(method(), CallOptions.DEFAULT, channel)
-        call.start(listener, Metadata())
+        call.start(listener, authorized())
         channel.calls.single().listener.onClose(Status.UNAUTHENTICATED, Metadata())
         assertFalse(call.isReady)
 

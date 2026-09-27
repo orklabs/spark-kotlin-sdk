@@ -164,7 +164,7 @@ public suspend fun SparkWallet.payLightningInvoice(
     // locked. Its leaves are TRANSFER_LOCKED, so selecting again would fail or swap other leaves.
     if (resumeTransferId != null) {
         val existing = queryTransferByIdOrNull(resumeTransferId)
-        if (canResumeLightningSend(existing, signer.identityPublicKey, config.sspIdentityPublicKey, payment.amountSats, maxFeeSats)) {
+        if (canResumeLightningSend(existing, signer.identityPublicKey, config.requireSspIdentityPublicKey(), payment.amountSats, maxFeeSats)) {
             return requestLightningSend(lightningSendVariables(paymentRequest, idempotencyKey, resumeTransferId), resumeTransferId)
         }
     }
@@ -220,7 +220,7 @@ private suspend fun SparkWallet.buildPreimageSwapRequest(
 ): Spark.InitiatePreimageSwapRequest {
     val networkStr = config.network.networkString
     // receiverIdentityPubkey = SSP identity public key (matching JS SDK)
-    val receiverPubKey = config.sspIdentityPublicKey
+    val receiverPubKey = config.requireSspIdentityPublicKey()
 
     // Single shared expiry time — 16 days from now (matching JS SDK)
     val expiryTime = Timestamp.newBuilder()
@@ -561,18 +561,12 @@ public suspend fun SparkWallet.getLightningSendFeeEstimate(encodedInvoice: Strin
 }
 
 /**
- * The SSP's lightning fee estimate, in whole sats rounded up. `original_value` is millisatoshi
- * and must be a whole, non-negative number; a value whose rounding would overflow is refused
- * instead of wrapping to a negative fee (which `payLightningInvoice` would then raise to 1 sat).
+ * The SSP's lightning fee estimate in sats, in the unit the SSP reports it in (the reference SDK
+ * switches on it too): SATOSHI as is, MILLISATOSHI rounded up; any other unit, or a value that is
+ * not a whole non-negative number, is refused.
  */
 internal fun lightningFeeEstimateSats(response: JSONObject): Long {
-    val msat = response.optJSONObject("lightning_send_fee_estimate")
-        ?.optJSONObject("fee_estimate")
-        ?.let { wholeNonNegativeLong(it.opt("original_value")) }
+    val estimate = response.optJSONObject("lightning_send_fee_estimate")
         ?: throw SparkError.InvalidResponse("Invalid fee estimate response")
-    return try {
-        Math.addExact(msat, 999L) / 1000
-    } catch (_: ArithmeticException) {
-        throw SparkError.UntrustedResponse("SSP fee estimate of $msat msat is out of range")
-    }
+    return SspCurrencyAmount.sats(estimate.optJSONObject("fee_estimate"), field = "lightning fee estimate")
 }

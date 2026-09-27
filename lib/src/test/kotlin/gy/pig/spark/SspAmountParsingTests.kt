@@ -9,7 +9,8 @@ import java.math.BigDecimal
 import java.math.BigInteger
 
 /**
- * SSP amounts are parsed as whole, non-negative numbers with overflow-checked arithmetic.
+ * SSP amounts are parsed as whole, non-negative numbers in the unit the SSP reports, with
+ * overflow-checked arithmetic.
  * `JSONObject.getLong` used to truncate decimals, parse strings and saturate huge values, and
  * `(msat + 999) / 1000` could then wrap to a negative fee that became a 1-sat fee.
  */
@@ -67,10 +68,19 @@ class SspAmountParsingTests {
     }
 
     @Test
-    fun aLightningFeeEstimateWhoseRoundingWouldOverflowIsUntrusted() {
-        // Long.MAX_VALUE msat: `+ 999` used to wrap negative and end up as a 1-sat fee.
-        val error = expectSparkError { lightningFeeEstimateSats(lightningResponse(Long.MAX_VALUE.toString())) }
-        assertTrue(error is SparkError.UntrustedResponse)
+    fun aLightningFeeEstimateOfLongMaxValueMillisatsRoundsUpWithoutOverflowing() {
+        // `+ 999` used to wrap negative and end up as a 1-sat fee; the division rounds up exactly.
+        assertEquals(Long.MAX_VALUE / 1000 + 1, lightningFeeEstimateSats(lightningResponse(Long.MAX_VALUE.toString())))
+    }
+
+    @Test
+    fun lightningFeeEstimatesAreReadInTheUnitTheSspReports() {
+        val sats = JSONObject("""{"lightning_send_fee_estimate":{"fee_estimate":{"original_value":1500,"original_unit":"SATOSHI"}}}""")
+        assertEquals(1_500L, lightningFeeEstimateSats(sats))
+        val unknown = JSONObject("""{"lightning_send_fee_estimate":{"fee_estimate":{"original_value":1500,"original_unit":"BITCOIN"}}}""")
+        assertTrue(expectSparkError { lightningFeeEstimateSats(unknown) } is SparkError.InvalidResponse)
+        val missing = JSONObject("""{"lightning_send_fee_estimate":{"fee_estimate":{"original_value":1500}}}""")
+        assertTrue(expectSparkError { lightningFeeEstimateSats(missing) } is SparkError.InvalidResponse)
     }
 
     private fun withdrawalResponse(userFee: String, l1Fee: String) = JSONObject(
@@ -82,6 +92,13 @@ class SspAmountParsingTests {
     @Test
     fun withdrawalFeeEstimatesAreTheSumOfTwoWholeNonNegativeNumbers() {
         assertEquals(1_950L, withdrawalFeeEstimateSats(withdrawalResponse("1500", "450")))
+        // Each fee in its own unit: 450 500 msat is 451 sats.
+        val mixed = JSONObject(
+            """{"coop_exit_fee_estimates":{"speed_fast":{""" +
+                """"user_fee":{"original_value":1500,"original_unit":"SATOSHI"},""" +
+                """"l1_broadcast_fee":{"original_value":450500,"original_unit":"MILLISATOSHI"}}}}""",
+        )
+        assertEquals(1_951L, withdrawalFeeEstimateSats(mixed))
         assertEquals(0L, withdrawalFeeEstimateSats(withdrawalResponse("0", "0")))
 
         for ((user, l1) in listOf("1e19" to "1", "12.5" to "1", "-1" to "1", "\"1500\"" to "1", "1" to "\"450\"", "1" to "-450")) {
