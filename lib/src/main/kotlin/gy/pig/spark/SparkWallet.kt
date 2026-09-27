@@ -64,6 +64,9 @@ public class SparkWallet private constructor(public val config: SparkConfig, pub
      */
     internal val claimLock = Mutex()
 
+    /** Running event streams, stopped by [close]. */
+    internal val eventStreams = EventStreamRegistry()
+
     // Every operator channel re-issues a call the operator rejects as UNAUTHENTICATED with a fresh
     // token (the official SDK's auth middleware), dropping the rejected token only if it is still
     // the cached one; the innermost interceptor feeds the operators' clock from their answers.
@@ -192,13 +195,15 @@ public class SparkWallet private constructor(public val config: SparkConfig, pub
     }
 
     /**
-     * Shut every operator connection down.
+     * Stop the wallet's event streams and shut every operator connection down.
      *
-     * The wallet stays usable: the next call after `close()` builds fresh channels (that is how
-     * a host app cycles connections around backgrounding). Safe to call more than once. Always
-     * pair construction with a `try / finally` to avoid leaking gRPC connections.
+     * The wallet stays usable for everything but events: the next call after `close()` builds
+     * fresh channels (that is how a host app cycles connections around backgrounding), while
+     * running [subscribeToEvents] collections end and new ones are refused. Safe to call more than
+     * once. Always pair construction with a `try / finally` to avoid leaking gRPC connections.
      */
     public suspend fun close() {
+        eventStreams.close()
         connectionManager.close()
     }
 

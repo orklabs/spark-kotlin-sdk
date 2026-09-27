@@ -342,12 +342,18 @@ val balances = wallet.getTokenBalances()
 ```kotlin
 import kotlinx.coroutines.flow.collect
 
-// Stream of inbound transfer / deposit events
+// Events until you stop collecting or close the wallet. The stream reconnects by itself
+// (1 s doubling to 15 s, `Reconnecting` before each wait), claims pending transfers on every
+// connection, and claims each incoming payment before reporting it as `TransferReceived`.
 wallet.subscribeToEvents().collect { event ->
-    println("event: $event")
+    when (event) {
+        is SparkEvent.TransferReceived -> println("received ${event.transfer.totalValueSats} sats")
+        is SparkEvent.Reconnecting -> println("retry #${event.attempt} in ${event.retryIn}: ${event.reason}")
+        SparkEvent.Connected, is SparkEvent.TransferSent, is SparkEvent.DepositConfirmed -> Unit
+    }
 }
 
-// Paginated history
+// History, 20 at a time: Spark transfers, Lightning payments, withdrawals and deposit claims
 val transfers = wallet.getTransfers(
     direction = TransferDirection.BOTH,
     limit = 20,

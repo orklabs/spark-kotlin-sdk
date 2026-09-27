@@ -172,11 +172,33 @@ public data class DepositFeeEstimate(val creditAmountSats: Long, val quoteSignat
 
 public data class WalletSettings(val privateEnabled: Boolean, val ownerIdentityPublicKey: String,)
 
+/** What [subscribeToEvents] reports. */
 public sealed class SparkEvent {
+    /** The event stream connected. */
     public data object Connected : SparkEvent()
+
+    /**
+     * A payment to this wallet arrived. The stream claims it first (best effort; one it cannot
+     * claim yet stays pending for the next claim pass), and on every connection it claims and
+     * reports the payments that arrived while it was down. The counter-transfers of the wallet's
+     * own swaps and transfers to itself are not reported: the operation that made them claims them.
+     */
     public data class TransferReceived(val transfer: SparkTransfer) : SparkEvent()
+
+    /**
+     * An outgoing transfer changed status — initiated, awaiting or applied the sender's key
+     * tweak, or returned — so one transfer is reported several times; `status` says which.
+     */
     public data class TransferSent(val transfer: SparkTransfer) : SparkEvent()
+
+    /** A deposit's leaf became available. */
     public data class DepositConfirmed(val treeID: String) : SparkEvent()
+
+    /**
+     * The event stream failed, or the operator ended it; it subscribes again after [retryIn].
+     * [attempt] counts the attempts since the stream was last connected.
+     */
+    public data class Reconnecting(val attempt: Int, val retryIn: kotlin.time.Duration, val reason: String) : SparkEvent()
 }
 
 public enum class TransferDirection {
