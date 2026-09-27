@@ -111,6 +111,49 @@ class ClaimVerificationTests {
         expectSparkError { TransferLeafVerifier.verify(transfer(listOf(good)), sender.identityPublicKey) }
     }
 
+    /** DER `SEQUENCE { INTEGER r, INTEGER s }` with the integers' content bytes exactly as given. */
+    private fun der(rContent: ByteArray, sContent: ByteArray): ByteArray {
+        val body = byteArrayOf(0x02, rContent.size.toByte()) + rContent + byteArrayOf(0x02, sContent.size.toByte()) + sContent
+        return byteArrayOf(0x30, body.size.toByte()) + body
+    }
+
+    @Test
+    fun derIntegersMissingTheirSignPadAreRejectedLikeLibsecp256k1() {
+        // Find a valid signature whose r has its top bit set: canonical DER then needs a 0x00 pad.
+        val n = KeyDerivation.ecDomainParams.n
+        var found: Triple<ByteArray, java.math.BigInteger, java.math.BigInteger>? = null
+        for (i in 0 until 256) {
+            val digest = TransferLeafVerifier.payloadHash(leafId = "leaf-$i", transferId = "tx", secretCipher = byteArrayOf(1, 2, 3))
+            val compact = sender.signCompactECDSA(digest, sender.identityPrivateKey)
+            val r = java.math.BigInteger(1, compact.copyOfRange(0, 32))
+            if (r.testBit(255)) {
+                found = Triple(digest, r, java.math.BigInteger(1, compact.copyOfRange(32, 64)))
+                break
+            }
+        }
+        val (digest, r, s) = found ?: throw AssertionError("no high-bit r in 256 signatures")
+        assertTrue(s < n.shiftRight(1))
+
+        // BigInteger.toByteArray() is the minimal two's-complement form, i.e. canonical DER content:
+        // r carries its 0x00 pad, and so does s in the rare case its first byte needs one.
+        val rPadded = r.toByteArray()
+        assertEquals(33, rPadded.size)
+        assertEquals(0, rPadded[0].toInt())
+        val rUnpadded = rPadded.copyOfRange(1, rPadded.size)
+        val sContent = s.toByteArray()
+        val canonical = der(rPadded, sContent)
+        assertTrue(TransferLeafVerifier.verifyECDSA(canonical, digest, sender.identityPublicKey))
+
+        // The same r without its 0x00 pad is a negative INTEGER in DER. libsecp256k1 reads it as
+        // zero, so the Swift SDK rejects it; reading it as the positive value would accept it.
+        val unpadded = der(rUnpadded, sContent)
+        assertFalse(TransferLeafVerifier.verifyECDSA(unpadded, digest, sender.identityPublicKey))
+        // Redundant padding and a non-minimal length are rejected too.
+        assertFalse(TransferLeafVerifier.verifyECDSA(der(byteArrayOf(0x00) + rPadded, sContent), digest, sender.identityPublicKey))
+        val longForm = byteArrayOf(0x30, 0x81.toByte(), canonical[1]) + canonical.copyOfRange(2, canonical.size)
+        assertFalse(TransferLeafVerifier.verifyECDSA(longForm, digest, sender.identityPublicKey))
+    }
+
     @Test
     fun highSSignaturesAreRejectedLikeLibsecp256k1() {
         // The Swift SDK verifies with libsecp256k1, which refuses the malleated (high-S) twin of

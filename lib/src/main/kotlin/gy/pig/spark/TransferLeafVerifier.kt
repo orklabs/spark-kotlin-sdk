@@ -52,14 +52,21 @@ internal object TransferLeafVerifier {
     private fun parseCompact(signature: ByteArray): Pair<BigInteger, BigInteger> =
         BigInteger(1, signature.copyOfRange(0, 32)) to BigInteger(1, signature.copyOfRange(32, 64))
 
-    /** DER `SEQUENCE { INTEGER r, INTEGER s }`, rejected unless it re-encodes to the same bytes. */
+    /**
+     * DER `SEQUENCE { INTEGER r, INTEGER s }`, rejected unless it re-encodes to the same bytes and
+     * both integers are positive as encoded. BouncyCastle already refuses redundant 0x00/0xFF
+     * padding; the sign is checked here because `positiveValue` would read an integer that is
+     * missing its 0x00 pad (high bit set, i.e. negative in DER) as the positive value, where
+     * libsecp256k1 treats it as zero and the signature as invalid.
+     */
     private fun parseStrictDer(signature: ByteArray): Pair<BigInteger, BigInteger>? {
         val sequence = ASN1Primitive.fromByteArray(signature) as? ASN1Sequence ?: return null
         if (sequence.size() != 2) return null
-        val r = sequence.getObjectAt(0) as? ASN1Integer ?: return null
-        val s = sequence.getObjectAt(1) as? ASN1Integer ?: return null
+        val r = (sequence.getObjectAt(0) as? ASN1Integer)?.value ?: return null
+        val s = (sequence.getObjectAt(1) as? ASN1Integer)?.value ?: return null
         if (!sequence.getEncoded(ASN1Encoding.DER).contentEquals(signature)) return null
-        return r.positiveValue to s.positiveValue
+        if (r.signum() <= 0 || s.signum() <= 0) return null
+        return r to s
     }
 
     /**
