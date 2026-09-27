@@ -92,14 +92,14 @@ The SDK ships precompiled `.so` libraries for `arm64-v8a`, `armeabi-v7a`, `x86`,
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("gy.pig:spark-kotlin-sdk:0.3.0")
+    implementation("gy.pig:spark-kotlin-sdk:0.3.1")
 }
 ```
 
 ```groovy
 // build.gradle
 dependencies {
-    implementation 'gy.pig:spark-kotlin-sdk:0.3.0'
+    implementation 'gy.pig:spark-kotlin-sdk:0.3.1'
 }
 ```
 
@@ -115,7 +115,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:v0.3.0")
+    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:v0.3.1")
     // JNA's own guidance for Android: depend on the aar so libjnidispatch.so is packaged.
     implementation("net.java.dev.jna:jna:5.17.0@aar")
 }

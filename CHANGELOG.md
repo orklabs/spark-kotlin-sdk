@@ -13,6 +13,12 @@ migration note.
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.3.1] — 2026-09-27
+
 Brings the Kotlin SDK level with spark-swift-sdk 0.3.1.
 
 ### Added
@@ -512,7 +518,8 @@ Initial public release.
   `build-frost-android.sh`. PRs that update the binaries must include a SHA-256 hash
   and the upstream commit they were built from.
 
-[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.1.0...v0.2.1
