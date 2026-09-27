@@ -661,8 +661,9 @@ class HardeningIntegrationTests {
      * address, checks the operators' co-signature, and broadcasts it. Opt-in
      * (`SPARK_TEST_ALLOW_REFUND=1`): it needs a confirmed unclaimed deposit — for example from the
      * opt-in withdrawal test with `SPARK_TEST_WITHDRAW_DESTINATION=receiver-static-deposit` — and
-     * pays the on-chain fee. Once refunded, the deposit can only be recovered on-chain, so the
-     * refund is always broadcast; the new output can be claimed again later.
+     * pays the on-chain fee (`SPARK_TEST_REFUND_SATS_PER_VBYTE`, 2 by default, times the SDK's
+     * 194-vbyte estimate). Once refunded, the deposit can only be recovered on-chain, so the refund
+     * is always broadcast; the new output can be claimed again later.
      */
     @Test(timeout = 10 * MINUTE)
     fun refundAnUnclaimedStaticDepositToTheWalletsOwnStaticAddress() = liveTest {
@@ -677,7 +678,7 @@ class HardeningIntegrationTests {
                     depositTransactionId = utxo.txid,
                     outputIndex = utxo.vout,
                     destinationAddress = address,
-                    satsPerVbyte = 2,
+                    satsPerVbyte = TestConfig.argument("SPARK_TEST_REFUND_SATS_PER_VBYTE")?.toLongOrNull() ?: 2,
                 )
                 val signed = RawTransaction.parse(txHex.hexToByteArray())
                 assertEquals(1, signed.inputs.size)

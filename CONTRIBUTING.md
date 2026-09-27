@@ -171,7 +171,7 @@ environment variables:
 | `SPARK_TEST_ALLOW_WITHDRAW_ALL=1` | `withdrawAll` of the sending wallet |
 | `SPARK_TEST_WITHDRAW_DESTINATION` | an address, or `receiver-static-deposit` to pay the other wallet's static address (default: the static-deposit withdraw address) |
 | `SPARK_TEST_CLAIM_STATIC=A` / `B` | claim that wallet's confirmed static deposits (`SPARK_TEST_CLAIM_STATIC_TXID=<txid>:<vout>` for one not indexed yet) |
-| `SPARK_TEST_ALLOW_REFUND=1` | refund an unclaimed static deposit to the wallet's own static address, and broadcast it |
+| `SPARK_TEST_ALLOW_REFUND=1` | refund an unclaimed static deposit to the wallet's own static address, and broadcast it (`SPARK_TEST_REFUND_SATS_PER_VBYTE`, default 2) |
 | `SPARK_TEST_RENEWAL=1` | bounce a leaf between the wallets until a claim renews it |
 
 > ⚠️ **Never commit mnemonics.** A mnemonic committed to git history is compromised
