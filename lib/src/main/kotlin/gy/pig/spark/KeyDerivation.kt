@@ -10,7 +10,7 @@ import java.nio.ByteBuffer
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
-data class DerivedKey(val privateKeyData: ByteArray, val publicKeyData: ByteArray,) {
+internal data class DerivedKey(val privateKeyData: ByteArray, val publicKeyData: ByteArray,) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is DerivedKey) return false
@@ -19,7 +19,7 @@ data class DerivedKey(val privateKeyData: ByteArray, val publicKeyData: ByteArra
     override fun hashCode(): Int = privateKeyData.contentHashCode()
 }
 
-class KeyDerivation private constructor(val accountKeyData: ByteArray, val accountChainCodeData: ByteArray,) {
+internal class KeyDerivation private constructor(val accountKeyData: ByteArray, val accountChainCodeData: ByteArray,) {
     companion object {
         const val SPARK_PURPOSE: Int = 8797555
         private const val HARDENED_OFFSET: Long = 0x80000000L

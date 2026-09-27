@@ -37,7 +37,7 @@ internal fun movableLeaves(leaves: List<SparkLeaf>): List<SparkLeaf> = leaves.fi
  * Critical: this NEVER overspends. Spark transfers spend the entire selected leaf set,
  * so picking more than `amountSats` would silently lose the difference.
  */
-suspend fun SparkWallet.selectLeavesWithSwap(amountSats: Long): List<SparkLeaf> {
+internal suspend fun SparkWallet.selectLeavesWithSwap(amountSats: Long): List<SparkLeaf> {
     val leaves = getSpendableLeaves()
 
     // First try exact selection (leaves that sum exactly to the target)
@@ -55,7 +55,7 @@ suspend fun SparkWallet.selectLeavesWithSwap(amountSats: Long): List<SparkLeaf> 
  * Request a leaf swap via SSP: splits existing leaves into target denominations.
  * Returns the wallet's leaves after the swap completes (with new claimed leaves).
  */
-suspend fun SparkWallet.requestLeavesSwap(targetAmounts: List<Long>): List<SparkLeaf> {
+internal suspend fun SparkWallet.requestLeavesSwap(targetAmounts: List<Long>): List<SparkLeaf> {
     val totalTarget = targetAmounts.sum()
     val leaves = getSpendableLeaves()
 
@@ -333,7 +333,7 @@ internal suspend fun SparkWallet.queryTransferByIdOrNull(transferId: String): Sp
  * Greedy descending: only adds a leaf if it fits in the remaining amount.
  * Returns null if no exact combination is found.
  */
-fun tryExactSelection(leaves: List<SparkLeaf>, amountSats: Long): List<SparkLeaf>? {
+internal fun tryExactSelection(leaves: List<SparkLeaf>, amountSats: Long): List<SparkLeaf>? {
     // Single-leaf exact match
     leaves.firstOrNull { it.valueSats == amountSats }?.let { return listOf(it) }
 

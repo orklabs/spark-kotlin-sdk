@@ -6,7 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import java.util.Date
 
-class SspAuthenticator(private val httpClient: OkHttpClient, private val sspURL: String, private val signer: SparkSignerProtocol,) {
+internal class SspAuthenticator(private val httpClient: OkHttpClient, private val sspURL: String, private val signer: SparkSignerProtocol,) {
     private data class CachedToken(val token: String, val expiresAt: Date,)
 
     private var cachedToken: CachedToken? = null

@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.mapNotNull
 import spark.Spark
 import java.util.Date
 
-suspend fun SparkWallet.subscribeToEvents(): Flow<SparkEvent> {
+public suspend fun SparkWallet.subscribeToEvents(): Flow<SparkEvent> {
     val stub = getCoordinatorStub()
 
     val request = Spark.SubscribeToEventsRequest.newBuilder()

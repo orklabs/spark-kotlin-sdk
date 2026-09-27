@@ -8,7 +8,7 @@ import java.nio.ByteBuffer
  * Hash a V2 token transaction. When [partialHash] is true, server-set fields
  * (output id, revocation commitment, withdraw bond/locktime, expiry) are omitted.
  */
-fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray {
+internal fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray {
     val allHashes = mutableListOf<ByteArray>()
 
     // Hash version
@@ -175,7 +175,7 @@ fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArra
 /**
  * Hash an operator-specific token transaction signable payload.
  */
-fun hashOperatorSpecificPayload(finalTokenTransactionHash: ByteArray, operatorIdentityPublicKey: ByteArray,): ByteArray {
+internal fun hashOperatorSpecificPayload(finalTokenTransactionHash: ByteArray, operatorIdentityPublicKey: ByteArray,): ByteArray {
     require(finalTokenTransactionHash.size == 32) { "Final token transaction hash must be 32 bytes" }
     require(operatorIdentityPublicKey.isNotEmpty()) { "Operator identity public key cannot be empty" }
 

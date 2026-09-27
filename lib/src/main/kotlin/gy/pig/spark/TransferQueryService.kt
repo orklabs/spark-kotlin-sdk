@@ -4,13 +4,13 @@ import com.google.protobuf.ByteString
 import spark.Spark
 import java.util.Date
 
-suspend fun SparkWallet.getTransfer(id: String): SparkTransfer {
+public suspend fun SparkWallet.getTransfer(id: String): SparkTransfer {
     val transfers = getTransfers(ids = listOf(id))
     return transfers.firstOrNull()
         ?: throw SparkError.InvalidResponse("Transfer not found: $id")
 }
 
-suspend fun SparkWallet.getTransfers(
+public suspend fun SparkWallet.getTransfers(
     ids: List<String> = emptyList(),
     direction: TransferDirection = TransferDirection.BOTH,
     limit: Long = 0,

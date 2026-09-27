@@ -12,7 +12,7 @@ package gy.pig.spark
  * total after) rather than assumed — SSP swaps are requested with fee_sats 0 today,
  * and this surfaces it if that ever changes.
  */
-data class SparkLeafConsolidation(
+public data class SparkLeafConsolidation(
     val leavesBefore: Int,
     val leavesAfter: Int,
     val totalSatsBefore: Long,
@@ -40,7 +40,7 @@ data class SparkLeafConsolidation(
  * operators online — this is maintenance, not the emergency path. Batched so a very
  * fragmented wallet never swaps more than [maxLeavesPerRound] leaves in one request.
  */
-suspend fun SparkWallet.consolidateLeaves(maxLeavesPerRound: Int = 100): SparkLeafConsolidation {
+public suspend fun SparkWallet.consolidateLeaves(maxLeavesPerRound: Int = 100): SparkLeafConsolidation {
     // Un-freeze what we can first: renewal resets low refund timelocks so those
     // leaves can join the swap instead of being skipped. Best-effort — a failed
     // renewal just leaves that leaf in the skipped bucket.

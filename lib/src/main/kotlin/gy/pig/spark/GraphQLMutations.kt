@@ -1,6 +1,6 @@
 package gy.pig.spark
 
-object GraphQLMutations {
+internal object GraphQLMutations {
     const val GET_CHALLENGE = """
         mutation GetChallenge(${'$'}public_key: PublicKey!) {
             get_challenge(input: { public_key: ${'$'}public_key }) {
@@ -188,7 +188,7 @@ object GraphQLMutations {
     """
 }
 
-object GraphQLQueries {
+internal object GraphQLQueries {
     const val GET_LIGHTNING_PAYMENT_STATUS = """
         query GetLightningPaymentStatus(${'$'}paymentHash: String!) {
             spark_lightning_payment(payment_hash: ${'$'}paymentHash) {

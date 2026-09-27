@@ -172,7 +172,7 @@ public suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amount
 }
 
 /** Compute next cpfp and direct sequences from a refund tx. */
-fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
+internal fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
     val rawSequence = parseSequenceFromRawTx(refundTxData)
     val currentTimelock = rawSequence and 0xFFFFu
     val bit30 = rawSequence and (1u shl 30)
@@ -194,7 +194,7 @@ fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
  * transferred/swapped without operator renewal. Strictly greater: the coordinator rejects
  * decrements that reach zero.
  */
-fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
+internal fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
     // An unparseable refund tx is treated as exhausted: the leaf is skipped rather than
     // crashing the caller or being handed to the coordinator with a bogus sequence.
     val sequence = try {
@@ -210,4 +210,4 @@ fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
  *
  * @throws SparkError.MalformedTransaction when the bytes are not a well-formed transaction.
  */
-fun parseSequenceFromRawTx(rawTx: ByteArray): UInt = RawTransaction.parse(rawTx, context = "leaf tx").firstInputSequence
+internal fun parseSequenceFromRawTx(rawTx: ByteArray): UInt = RawTransaction.parse(rawTx, context = "leaf tx").firstInputSequence

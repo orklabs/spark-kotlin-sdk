@@ -18,7 +18,10 @@ import java.util.concurrent.TimeUnit
  * grpc-java channels reconnect by themselves after a transport failure, so unlike the Swift SDK
  * there is no need to evict a client whose connection loop ended.
  */
-class GrpcConnectionManager(private val addresses: List<String>, private val interceptorFactory: (String) -> List<ClientInterceptor> = { emptyList() },) {
+internal class GrpcConnectionManager(
+    private val addresses: List<String>,
+    private val interceptorFactory: (String) -> List<ClientInterceptor> = { emptyList() },
+) {
     private val channels = mutableMapOf<String, ManagedChannel>()
     private val mutex = Mutex()
 

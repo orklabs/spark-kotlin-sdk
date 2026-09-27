@@ -63,7 +63,7 @@ public val SparkLeaf.isRenewable: Boolean
  * Outcome of a renewal sweep. Renewals are per-leaf and best-effort: one failing leaf
  * never aborts the rest.
  */
-data class SparkLeafRenewal(
+public data class SparkLeafRenewal(
     val checked: Int,
     val renewed: Int,
     /** "leafId: error" for each leaf that could not be renewed. */

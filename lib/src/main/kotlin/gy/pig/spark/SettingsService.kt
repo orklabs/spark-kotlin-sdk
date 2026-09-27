@@ -2,7 +2,7 @@ package gy.pig.spark
 
 import spark.Spark
 
-suspend fun SparkWallet.setPrivacyEnabled(enabled: Boolean): WalletSettings {
+public suspend fun SparkWallet.setPrivacyEnabled(enabled: Boolean): WalletSettings {
     val stub = getCoordinatorStub()
 
     val request = Spark.UpdateWalletSettingRequest.newBuilder()
@@ -18,7 +18,7 @@ suspend fun SparkWallet.setPrivacyEnabled(enabled: Boolean): WalletSettings {
     )
 }
 
-suspend fun SparkWallet.getWalletSettings(): WalletSettings {
+public suspend fun SparkWallet.getWalletSettings(): WalletSettings {
     val stub = getCoordinatorStub()
 
     val request = Spark.QueryWalletSettingRequest.getDefaultInstance()

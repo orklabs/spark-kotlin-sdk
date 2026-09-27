@@ -1,8 +1,8 @@
 package gy.pig.spark
 
-typealias Bech32mTokenIdentifier = String
+public typealias Bech32mTokenIdentifier = String
 
-object TokenIdentifierPrefix {
+internal object TokenIdentifierPrefix {
     fun prefix(network: SparkNetwork): String = when (network) {
         SparkNetwork.MAINNET -> "btkn"
         SparkNetwork.REGTEST -> "btknrt"
@@ -15,7 +15,7 @@ object TokenIdentifierPrefix {
     }
 }
 
-fun encodeBech32mTokenIdentifier(rawIdentifier: ByteArray, network: SparkNetwork): Bech32mTokenIdentifier {
+public fun encodeBech32mTokenIdentifier(rawIdentifier: ByteArray, network: SparkNetwork): Bech32mTokenIdentifier {
     require(rawIdentifier.size == 32) {
         "Token identifier must be 32 bytes, got ${rawIdentifier.size}"
     }
@@ -24,7 +24,7 @@ fun encodeBech32mTokenIdentifier(rawIdentifier: ByteArray, network: SparkNetwork
     return Bech32m.encode(hrp, words)
 }
 
-fun decodeBech32mTokenIdentifier(bech32mIdentifier: Bech32mTokenIdentifier, network: SparkNetwork? = null,): Pair<ByteArray, SparkNetwork> {
+public fun decodeBech32mTokenIdentifier(bech32mIdentifier: Bech32mTokenIdentifier, network: SparkNetwork? = null,): Pair<ByteArray, SparkNetwork> {
     val (hrp, data) = Bech32m.decodeBech32m(bech32mIdentifier)
 
     if (network != null) {

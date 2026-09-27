@@ -43,9 +43,9 @@ public data class WalletBalance(public val satsBalance: SatsBalance, public val 
     public val totalSats: Long get() = satsBalance.available
 }
 
-data class SparkLeaf(val id: String, val treeID: String, val valueSats: Long, val status: String, internal val node: spark.Spark.TreeNode? = null,)
+public data class SparkLeaf(val id: String, val treeID: String, val valueSats: Long, val status: String, internal val node: spark.Spark.TreeNode? = null,)
 
-data class SparkTransfer(
+public data class SparkTransfer(
     val id: String,
     val senderIdentityPublicKey: String,
     val receiverIdentityPublicKey: String,
@@ -56,7 +56,7 @@ data class SparkTransfer(
     val sparkInvoice: String? = null,
 )
 
-data class DepositAddress(val address: String, val leafId: String, val userPublicKey: ByteArray, val verifyingKey: ByteArray,) {
+public data class DepositAddress(val address: String, val leafId: String, val userPublicKey: ByteArray, val verifyingKey: ByteArray,) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is DepositAddress) return false
@@ -65,7 +65,7 @@ data class DepositAddress(val address: String, val leafId: String, val userPubli
     override fun hashCode(): Int = address.hashCode() * 31 + leafId.hashCode()
 }
 
-data class StaticDepositAddress(val address: String, val verifyingKey: ByteArray,) {
+public data class StaticDepositAddress(val address: String, val verifyingKey: ByteArray,) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is StaticDepositAddress) return false
@@ -74,9 +74,9 @@ data class StaticDepositAddress(val address: String, val verifyingKey: ByteArray
     override fun hashCode(): Int = address.hashCode()
 }
 
-data class LightningInvoice(val paymentRequest: String, val paymentHash: String, val amountSats: Long, val expiresAt: Date,)
+public data class LightningInvoice(val paymentRequest: String, val paymentHash: String, val amountSats: Long, val expiresAt: Date,)
 
-data class FeeQuote(val feeSats: Long, val feeRateSatsPerVbyte: Long,)
+public data class FeeQuote(val feeSats: Long, val feeRateSatsPerVbyte: Long,)
 
 /**
  * What [withdrawAll] would do right now. Produced by [quoteWithdrawAll] after pending inbound
@@ -129,7 +129,7 @@ public data class WithdrawAllResult(
     public val feeSats: Long get() = sentSats - payoutSats
 }
 
-data class UnusedDepositAddress(val address: String, val leafId: String, val userSigningPublicKey: ByteArray, val verifyingPublicKey: ByteArray,) {
+public data class UnusedDepositAddress(val address: String, val leafId: String, val userSigningPublicKey: ByteArray, val verifyingPublicKey: ByteArray,) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is UnusedDepositAddress) return false
@@ -138,18 +138,18 @@ data class UnusedDepositAddress(val address: String, val leafId: String, val use
     override fun hashCode(): Int = address.hashCode() * 31 + leafId.hashCode()
 }
 
-data class DepositFeeEstimate(val creditAmountSats: Long, val quoteSignature: String,)
+public data class DepositFeeEstimate(val creditAmountSats: Long, val quoteSignature: String,)
 
-data class WalletSettings(val privateEnabled: Boolean, val ownerIdentityPublicKey: String,)
+public data class WalletSettings(val privateEnabled: Boolean, val ownerIdentityPublicKey: String,)
 
-sealed class SparkEvent {
-    data object Connected : SparkEvent()
-    data class TransferReceived(val transfer: SparkTransfer) : SparkEvent()
-    data class TransferSent(val transfer: SparkTransfer) : SparkEvent()
-    data class DepositConfirmed(val treeID: String) : SparkEvent()
+public sealed class SparkEvent {
+    public data object Connected : SparkEvent()
+    public data class TransferReceived(val transfer: SparkTransfer) : SparkEvent()
+    public data class TransferSent(val transfer: SparkTransfer) : SparkEvent()
+    public data class DepositConfirmed(val treeID: String) : SparkEvent()
 }
 
-enum class TransferDirection {
+public enum class TransferDirection {
     SENT,
     RECEIVED,
     BOTH,
@@ -157,7 +157,7 @@ enum class TransferDirection {
 
 // MARK: - Token Types
 
-data class TokenMetadataInfo(
+public data class TokenMetadataInfo(
     val tokenIdentifier: String,
     val rawTokenIdentifier: ByteArray,
     val issuerPublicKey: ByteArray,
@@ -176,9 +176,9 @@ data class TokenMetadataInfo(
     override fun hashCode(): Int = tokenIdentifier.hashCode()
 }
 
-data class TokenBalance(val tokenMetadata: TokenMetadataInfo, val ownedBalance: BigInteger, val availableToSendBalance: BigInteger,)
+public data class TokenBalance(val tokenMetadata: TokenMetadataInfo, val ownedBalance: BigInteger, val availableToSendBalance: BigInteger,)
 
-data class TokenOutputInfo(
+public data class TokenOutputInfo(
     val id: String?,
     val ownerPublicKey: ByteArray,
     val tokenIdentifier: ByteArray,
@@ -195,9 +195,9 @@ data class TokenOutputInfo(
     override fun hashCode(): Int = (id?.hashCode() ?: 0) * 31 + previousTransactionVout.hashCode()
 }
 
-data class TokenCreationResult(val transactionHash: String, val tokenIdentifier: String?,)
+public data class TokenCreationResult(val transactionHash: String, val tokenIdentifier: String?,)
 
-enum class TokenOutputSelectionStrategy {
+public enum class TokenOutputSelectionStrategy {
     SMALL_FIRST,
     LARGE_FIRST,
 }
@@ -212,7 +212,7 @@ enum class TokenOutputSelectionStrategy {
  * Decode a 16-byte big-endian unsigned 128-bit integer.
  * Throws [IllegalArgumentException] if [data] is not exactly 16 bytes.
  */
-fun decodeUInt128(data: com.google.protobuf.ByteString): BigInteger {
+public fun decodeUInt128(data: com.google.protobuf.ByteString): BigInteger {
     require(data.size() == 16) { "UInt128 must be exactly 16 bytes, got ${data.size()}" }
     // signum=1 forces unsigned interpretation of the magnitude bytes.
     return BigInteger(1, data.toByteArray())
@@ -222,7 +222,7 @@ fun decodeUInt128(data: com.google.protobuf.ByteString): BigInteger {
  * Encode an unsigned 128-bit integer as a 16-byte big-endian byte array.
  * Throws [IllegalArgumentException] if [value] is negative or exceeds 2^128 − 1.
  */
-fun encodeUInt128(value: BigInteger): ByteArray {
+public fun encodeUInt128(value: BigInteger): ByteArray {
     require(value.signum() >= 0) { "UInt128 must be non-negative, got $value" }
     require(value.bitLength() <= 128) { "UInt128 must fit in 128 bits, got $value" }
     val raw = value.toByteArray() // signed two's-complement, big-endian; may have leading 0x00
@@ -236,18 +236,18 @@ fun encodeUInt128(value: BigInteger): ByteArray {
 
 // MARK: - SSP Transfer Types
 
-data class TransferWithUserRequest(val sparkId: String, val totalAmountSats: Long?, val userRequest: UserRequest?,)
+public data class TransferWithUserRequest(val sparkId: String, val totalAmountSats: Long?, val userRequest: UserRequest?,)
 
-sealed class UserRequest {
-    data class LightningReceive(val info: LightningReceiveInfo) : UserRequest()
-    data class LightningSend(val info: LightningSendInfo) : UserRequest()
-    data class CoopExit(val info: CoopExitInfo) : UserRequest()
-    data class LeavesSwap(val info: LeavesSwapInfo) : UserRequest()
-    data class ClaimStaticDeposit(val info: ClaimStaticDepositInfo) : UserRequest()
-    data class Unknown(val typeName: String) : UserRequest()
+public sealed class UserRequest {
+    public data class LightningReceive(val info: LightningReceiveInfo) : UserRequest()
+    public data class LightningSend(val info: LightningSendInfo) : UserRequest()
+    public data class CoopExit(val info: CoopExitInfo) : UserRequest()
+    public data class LeavesSwap(val info: LeavesSwapInfo) : UserRequest()
+    public data class ClaimStaticDeposit(val info: ClaimStaticDepositInfo) : UserRequest()
+    public data class Unknown(val typeName: String) : UserRequest()
 }
 
-data class LightningReceiveInfo(
+public data class LightningReceiveInfo(
     val id: String,
     val status: String,
     val encodedInvoice: String?,
@@ -257,7 +257,7 @@ data class LightningReceiveInfo(
     val paymentPreimage: String?,
 )
 
-data class LightningSendInfo(
+public data class LightningSendInfo(
     val id: String,
     val status: String,
     val encodedInvoice: String?,
@@ -266,12 +266,12 @@ data class LightningSendInfo(
     val paymentPreimage: String?,
 )
 
-data class CoopExitInfo(val id: String, val status: String, val coopExitTxid: String?,)
+public data class CoopExitInfo(val id: String, val status: String, val coopExitTxid: String?,)
 
-data class LeavesSwapInfo(val id: String, val status: String,)
+public data class LeavesSwapInfo(val id: String, val status: String,)
 
-data class ClaimStaticDepositInfo(val id: String, val status: String, val transactionId: String?, val outputIndex: Int?,)
+public data class ClaimStaticDepositInfo(val id: String, val status: String, val transactionId: String?, val outputIndex: Int?,)
 
 // MARK: - Invoice Query Types
 
-data class SparkInvoiceStatus(val invoice: String, val status: String, val satsTransferId: String?, val tokenTransactionHash: String?,)
+public data class SparkInvoiceStatus(val invoice: String, val status: String, val satsTransferId: String?, val tokenTransactionHash: String?,)

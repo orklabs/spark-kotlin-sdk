@@ -12,7 +12,7 @@ import java.security.MessageDigest
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-fun String.hexToByteArray(): ByteArray {
+internal fun String.hexToByteArray(): ByteArray {
     val hex = if (startsWith("0x")) substring(2) else this
     check(hex.length % 2 == 0) { "Hex string must have even length" }
     return ByteArray(hex.length / 2) { i ->
@@ -21,7 +21,7 @@ fun String.hexToByteArray(): ByteArray {
     }
 }
 
-fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
+internal fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
 
 /**
  * Strict hex decoding: `null` for an odd length or any non-hex character (Swift's
@@ -95,28 +95,28 @@ internal inline fun <T> bestEffort(block: () -> T): T? = try {
     null
 }
 
-fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
+internal fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
 
-fun hmacSHA512(key: ByteArray, data: ByteArray): ByteArray {
+internal fun hmacSHA512(key: ByteArray, data: ByteArray): ByteArray {
     val mac = Mac.getInstance("HmacSHA512")
     mac.init(SecretKeySpec(key, "HmacSHA512"))
     return mac.doFinal(data)
 }
 
-fun hmacSHA256(key: ByteArray, data: ByteArray): ByteArray {
+internal fun hmacSHA256(key: ByteArray, data: ByteArray): ByteArray {
     val mac = Mac.getInstance("HmacSHA256")
     mac.init(SecretKeySpec(key, "HmacSHA256"))
     return mac.doFinal(data)
 }
 
-fun decodeBase64URL(string: String): ByteArray? = try {
+internal fun decodeBase64URL(string: String): ByteArray? = try {
     Base64.decode(string, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
 } catch (_: Exception) {
     null
 }
 
 /** Parse ISO 8601 date strings with various fractional second formats and timezone offsets. */
-fun parseISODate(dateStr: String): java.util.Date = parseISODateOrNull(dateStr) ?: java.util.Date(System.currentTimeMillis() + 3600_000)
+internal fun parseISODate(dateStr: String): java.util.Date = parseISODateOrNull(dateStr) ?: java.util.Date(System.currentTimeMillis() + 3600_000)
 
 /** [parseISODate] without the "one hour from now" fallback: `null` when the string does not parse. */
 internal fun parseISODateOrNull(dateStr: String): java.util.Date? = try {
@@ -136,7 +136,7 @@ internal fun parseISODateOrNull(dateStr: String): java.util.Date? = try {
 
 // MARK: - BIP-340 Tagged Hash
 
-class SparkHasher(tag: List<String>) {
+internal class SparkHasher(tag: List<String>) {
     private val buffer = java.io.ByteArrayOutputStream()
 
     init {
@@ -229,7 +229,7 @@ private fun serializeScalar(limbs: ULongArray): ByteArray {
 }
 
 /** Compute (a - b) mod n over the secp256k1 curve order */
-fun subtractPrivateKeys(a: ByteArray, b: ByteArray): ByteArray {
+internal fun subtractPrivateKeys(a: ByteArray, b: ByteArray): ByteArray {
     val aLimbs = parseScalar(a)
     val bLimbs = parseScalar(b)
 

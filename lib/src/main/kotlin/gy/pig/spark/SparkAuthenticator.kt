@@ -7,7 +7,7 @@ import spark_authn.SparkAuthn
 import spark_authn.SparkAuthnServiceGrpcKt
 import java.util.Date
 
-class SparkAuthenticator {
+internal class SparkAuthenticator {
     private data class CachedToken(val token: String, val expiresAt: Date,)
 
     private val tokenCache = mutableMapOf<String, CachedToken>()

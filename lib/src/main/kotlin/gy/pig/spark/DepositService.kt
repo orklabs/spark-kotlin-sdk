@@ -8,7 +8,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 
-suspend fun SparkWallet.getDepositAddress(): DepositAddress {
+public suspend fun SparkWallet.getDepositAddress(): DepositAddress {
     val stub = getCoordinatorStub()
 
     // A one-time deposit address is keyed to a fresh leaf: derive its signing
@@ -37,7 +37,7 @@ suspend fun SparkWallet.getDepositAddress(): DepositAddress {
     )
 }
 
-suspend fun SparkWallet.getStaticDepositAddress(): StaticDepositAddress {
+public suspend fun SparkWallet.getStaticDepositAddress(): StaticDepositAddress {
     val stub = getCoordinatorStub()
 
     val request = Spark.GenerateStaticDepositAddressRequest.newBuilder()
@@ -54,7 +54,7 @@ suspend fun SparkWallet.getStaticDepositAddress(): StaticDepositAddress {
     )
 }
 
-suspend fun SparkWallet.queryUnusedDepositAddresses(limit: Int = 100, offset: Int = 0,): List<UnusedDepositAddress> {
+public suspend fun SparkWallet.queryUnusedDepositAddresses(limit: Int = 100, offset: Int = 0,): List<UnusedDepositAddress> {
     val stub = getCoordinatorStub()
 
     val request = Spark.QueryUnusedDepositAddressesRequest.newBuilder()
@@ -76,7 +76,7 @@ suspend fun SparkWallet.queryUnusedDepositAddresses(limit: Int = 100, offset: In
     }
 }
 
-suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex: UInt = 0u,): DepositFeeEstimate {
+public suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex: UInt = 0u,): DepositFeeEstimate {
     val result = sspClient.executeRaw(
         query = GraphQLQueries.STATIC_DEPOSIT_QUOTE,
         variables = mapOf(
@@ -96,7 +96,7 @@ suspend fun SparkWallet.getDepositFeeEstimate(transactionId: String, outputIndex
     return DepositFeeEstimate(creditAmountSats = creditAmountSats, quoteSignature = quoteSignature)
 }
 
-suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt = 0u,): String {
+public suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: UInt = 0u,): String {
     val feeEstimate = getDepositFeeEstimate(transactionId, outputIndex)
 
     // Build signing payload matching Swift SDK
@@ -133,7 +133,7 @@ suspend fun SparkWallet.claimStaticDeposit(transactionId: String, outputIndex: U
     return result.getJSONObject("claim_static_deposit").getString("transfer_id")
 }
 
-suspend fun SparkWallet.queryStaticDepositAddresses(): List<StaticDepositAddress> {
+public suspend fun SparkWallet.queryStaticDepositAddresses(): List<StaticDepositAddress> {
     val stub = getCoordinatorStub()
 
     val request = Spark.QueryStaticDepositAddressesRequest.newBuilder()
@@ -152,9 +152,9 @@ suspend fun SparkWallet.queryStaticDepositAddresses(): List<StaticDepositAddress
     }
 }
 
-data class DepositUtxo(val txid: String, val vout: UInt,)
+public data class DepositUtxo(val txid: String, val vout: UInt,)
 
-suspend fun SparkWallet.getUtxosForDepositAddress(address: String, excludeClaimed: Boolean = true,): List<DepositUtxo> {
+public suspend fun SparkWallet.getUtxosForDepositAddress(address: String, excludeClaimed: Boolean = true,): List<DepositUtxo> {
     val stub = getCoordinatorStub()
 
     val request = Spark.GetUtxosForAddressRequest.newBuilder()
@@ -173,7 +173,7 @@ suspend fun SparkWallet.getUtxosForDepositAddress(address: String, excludeClaime
     }
 }
 
-suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxFee: Long, outputIndex: UInt = 0u,): String? {
+public suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: String, maxFee: Long, outputIndex: UInt = 0u,): String? {
     val quote = getDepositFeeEstimate(transactionId, outputIndex)
 
     val rawTx = fetchRawTransaction(transactionId)
@@ -304,7 +304,12 @@ public suspend fun SparkWallet.claimDeposit(txID: String, vout: UInt? = null) {
     stub.finalizeDepositTreeCreation(finalizeReq)
 }
 
-suspend fun SparkWallet.refundStaticDeposit(depositTransactionId: String, outputIndex: UInt = 0u, destinationAddress: String, satsPerVbyte: Long,): String {
+public suspend fun SparkWallet.refundStaticDeposit(
+    depositTransactionId: String,
+    outputIndex: UInt = 0u,
+    destinationAddress: String,
+    satsPerVbyte: Long,
+): String {
     require(satsPerVbyte <= 150) { "satsPerVbyte must be <= 150" }
 
     val estimatedVbytes = 194L
@@ -412,7 +417,7 @@ suspend fun SparkWallet.refundStaticDeposit(depositTransactionId: String, output
     return signedTx.toHexString()
 }
 
-suspend fun SparkWallet.refundAndBroadcastStaticDeposit(
+public suspend fun SparkWallet.refundAndBroadcastStaticDeposit(
     depositTransactionId: String,
     outputIndex: UInt = 0u,
     destinationAddress: String,
@@ -427,7 +432,7 @@ suspend fun SparkWallet.refundAndBroadcastStaticDeposit(
     return broadcastTransaction(txHex)
 }
 
-suspend fun SparkWallet.broadcastTransaction(txHex: String): String {
+public suspend fun SparkWallet.broadcastTransaction(txHex: String): String {
     val baseURL = when (config.network) {
         SparkNetwork.MAINNET -> "https://mempool.space/api"
         SparkNetwork.REGTEST -> "http://localhost:3000"

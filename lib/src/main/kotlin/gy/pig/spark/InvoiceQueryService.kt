@@ -2,7 +2,7 @@ package gy.pig.spark
 
 import spark.Spark
 
-suspend fun SparkWallet.querySparkInvoices(invoices: List<String>, limit: Long = 0, offset: Long = 0,): List<SparkInvoiceStatus> {
+public suspend fun SparkWallet.querySparkInvoices(invoices: List<String>, limit: Long = 0, offset: Long = 0,): List<SparkInvoiceStatus> {
     val stub = getCoordinatorStub()
 
     val request = Spark.QuerySparkInvoicesRequest.newBuilder()

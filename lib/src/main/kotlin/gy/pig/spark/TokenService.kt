@@ -10,7 +10,7 @@ private const val MAX_TOKEN_OUTPUTS_TX = 500
 
 // MARK: - Public Token API
 
-suspend fun SparkWallet.transferTokens(
+public suspend fun SparkWallet.transferTokens(
     tokenIdentifier: Bech32mTokenIdentifier,
     tokenAmount: BigInteger,
     receiverSparkAddress: String,
@@ -44,7 +44,7 @@ suspend fun SparkWallet.transferTokens(
     )
 }
 
-suspend fun SparkWallet.getTokenBalances(): List<TokenBalance> {
+public suspend fun SparkWallet.getTokenBalances(): List<TokenBalance> {
     val outputs = fetchTokenOutputs()
 
     val balancesByToken = mutableMapOf<ByteString, Pair<BigInteger, BigInteger>>()
@@ -70,7 +70,7 @@ suspend fun SparkWallet.getTokenBalances(): List<TokenBalance> {
     }
 }
 
-suspend fun SparkWallet.getTokenOutputs(tokenIdentifier: Bech32mTokenIdentifier? = null,): List<TokenOutputInfo> {
+public suspend fun SparkWallet.getTokenOutputs(tokenIdentifier: Bech32mTokenIdentifier? = null,): List<TokenOutputInfo> {
     val rawTokenIds = tokenIdentifier?.let {
         val (rawId, _) = decodeBech32mTokenIdentifier(it, config.network)
         listOf(rawId)
@@ -91,7 +91,7 @@ suspend fun SparkWallet.getTokenOutputs(tokenIdentifier: Bech32mTokenIdentifier?
     }
 }
 
-suspend fun SparkWallet.queryTokenMetadata(
+public suspend fun SparkWallet.queryTokenMetadata(
     tokenIdentifiers: List<Bech32mTokenIdentifier>? = null,
     issuerPublicKeys: List<ByteArray>? = null,
 ): List<TokenMetadataInfo> {
@@ -126,7 +126,7 @@ suspend fun SparkWallet.queryTokenMetadata(
 
 // MARK: - Token Issuance
 
-suspend fun SparkWallet.createToken(
+public suspend fun SparkWallet.createToken(
     tokenName: String,
     tokenTicker: String,
     decimals: UInt,
@@ -173,7 +173,7 @@ suspend fun SparkWallet.createToken(
     return TokenCreationResult(transactionHash = txHash, tokenIdentifier = bech32TokenId)
 }
 
-suspend fun SparkWallet.mintTokens(tokenIdentifier: Bech32mTokenIdentifier, tokenAmount: BigInteger, idempotencyKey: String? = null,): String {
+public suspend fun SparkWallet.mintTokens(tokenIdentifier: Bech32mTokenIdentifier, tokenAmount: BigInteger, idempotencyKey: String? = null,): String {
     require(tokenAmount > BigInteger.ZERO) { "Mint amount must be greater than 0" }
 
     val (rawTokenId, _) = decodeBech32mTokenIdentifier(tokenIdentifier, config.network)
@@ -207,7 +207,7 @@ suspend fun SparkWallet.mintTokens(tokenIdentifier: Bech32mTokenIdentifier, toke
     )
 }
 
-suspend fun SparkWallet.burnTokens(
+public suspend fun SparkWallet.burnTokens(
     tokenIdentifier: Bech32mTokenIdentifier,
     tokenAmount: BigInteger,
     strategy: TokenOutputSelectionStrategy = TokenOutputSelectionStrategy.SMALL_FIRST,

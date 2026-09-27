@@ -5,7 +5,7 @@ import common.Common
 import spark.Spark
 import uniffi.spark_frost.*
 
-object FrostSigningHelper {
+internal object FrostSigningHelper {
 
     fun buildSigningJob(
         leafID: String,

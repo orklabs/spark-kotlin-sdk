@@ -8,7 +8,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 
-class SspGraphQLClient(
+internal class SspGraphQLClient(
     private val httpClient: OkHttpClient,
     private val sspURL: String,
     private val getToken: suspend () -> String,
@@ -55,7 +55,7 @@ class SspGraphQLClient(
     }
 }
 
-suspend fun executeGraphQL(httpClient: OkHttpClient, url: String, token: String?, query: String, variables: Map<String, Any>?,): JSONObject =
+internal suspend fun executeGraphQL(httpClient: OkHttpClient, url: String, token: String?, query: String, variables: Map<String, Any>?,): JSONObject =
     withContext(Dispatchers.IO) {
         val body = JSONObject().apply {
             put("query", query)

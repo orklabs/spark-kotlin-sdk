@@ -45,7 +45,7 @@ import spark_token.SparkTokenServiceGrpcKt
  * @see SparkSignerProtocol
  * @see SparkError
  */
-class SparkWallet private constructor(val config: SparkConfig, val signer: SparkSignerProtocol,) {
+public class SparkWallet private constructor(public val config: SparkConfig, public val signer: SparkSignerProtocol,) {
     internal val authenticator = SparkAuthenticator()
 
     /**
@@ -71,7 +71,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
      * The wallet's identity public key as a lowercase hex string (33-byte compressed
      * secp256k1). Share this value with anyone who wants to send you a Spark transfer.
      */
-    val identityPublicKeyHex: String
+    public val identityPublicKeyHex: String
         get() = signer.identityPublicKey.toHexString()
 
     /**
@@ -84,7 +84,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
      * @param messageHash exactly 32 bytes (typically `sha256(message)`).
      * @return DER-encoded ECDSA signature.
      */
-    fun signWithIdentityKey(messageHash: ByteArray): ByteArray = signer.signWithIdentityKey(messageHash)
+    public fun signWithIdentityKey(messageHash: ByteArray): ByteArray = signer.signWithIdentityKey(messageHash)
 
     init {
         val httpClient = OkHttpClient()
@@ -97,7 +97,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
         )
     }
 
-    companion object {
+    public companion object {
         /**
          * Create a wallet from a BIP-39 mnemonic.
          *
@@ -118,7 +118,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
          * @throws SparkError.InvalidMnemonic when validation is on and the phrase is not valid BIP-39.
          * @throws SparkError.InvalidArgument for a negative [account].
          */
-        fun fromMnemonic(config: SparkConfig = SparkConfig(), mnemonic: String, account: Int? = null, validateMnemonic: Boolean = true): SparkWallet {
+        public fun fromMnemonic(config: SparkConfig = SparkConfig(), mnemonic: String, account: Int? = null, validateMnemonic: Boolean = true): SparkWallet {
             val resolvedAccount = account ?: if (config.network == SparkNetwork.MAINNET) 1 else 0
             val signer = SparkSigner.fromMnemonic(mnemonic, resolvedAccount, validateMnemonic = validateMnemonic)
             return SparkWallet(config, signer)
@@ -137,7 +137,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
          *   wallet is constructed.
          * @throws IllegalArgumentException if `accountKey.size != 64`.
          */
-        fun fromAccountKey(config: SparkConfig = SparkConfig(), accountKey: ByteArray,): SparkWallet {
+        public fun fromAccountKey(config: SparkConfig = SparkConfig(), accountKey: ByteArray,): SparkWallet {
             require(accountKey.size == 64) { "Account key must be 64 bytes" }
             val key = accountKey.copyOfRange(0, 32)
             val chainCode = accountKey.copyOfRange(32, 64)
@@ -154,7 +154,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
          * @param signer Implementation of [SparkSignerProtocol]. The SDK never inspects
          *   the underlying private material; it only invokes the protocol methods.
          */
-        fun fromSigner(config: SparkConfig = SparkConfig(), signer: SparkSignerProtocol,): SparkWallet = SparkWallet(config, signer)
+        public fun fromSigner(config: SparkConfig = SparkConfig(), signer: SparkSignerProtocol,): SparkWallet = SparkWallet(config, signer)
     }
 
     /**
@@ -168,7 +168,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
      * @throws SparkError.InvalidArgument if the wallet was created via [fromSigner] with a
      *   custom signer: only wallets created from a mnemonic or an account key can export it.
      */
-    fun exportAccountKey(): ByteArray {
+    public fun exportAccountKey(): ByteArray {
         val keySigner = signer as? SparkSigner
             ?: throw SparkError.InvalidArgument("exportAccountKey is only available for wallets created from a mnemonic or account key")
         return keySigner.exportAccountKey()
@@ -181,7 +181,7 @@ class SparkWallet private constructor(val config: SparkConfig, val signer: Spark
      * a host app cycles connections around backgrounding). Safe to call more than once. Always
      * pair construction with a `try / finally` to avoid leaking gRPC connections.
      */
-    suspend fun close() {
+    public suspend fun close() {
         connectionManager.close()
     }
 

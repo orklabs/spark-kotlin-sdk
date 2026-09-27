@@ -2,7 +2,7 @@
 <SmellBaseline>
   <ManuallySuppressedIssues/>
   <CurrentIssues>
-    <ID>CyclomaticComplexMethod:TokenHashing.kt$fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray</ID>
+    <ID>CyclomaticComplexMethod:TokenHashing.kt$internal fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray</ID>
     <ID>CyclomaticComplexMethod:spark_frost.kt$@Suppress("UNUSED_PARAMETER") private fun uniffiCheckApiChecksums(lib: UniffiLib)</ID>
     <ID>FunctionNaming:spark_frost.kt$@Throws(Exception::class) fun `aggregateFrost`(`msg`: kotlin.ByteArray, `statechainCommitments`: Map&lt;kotlin.String, SigningCommitment>, `selfCommitment`: SigningCommitment, `statechainSignatures`: Map&lt;kotlin.String, kotlin.ByteArray>, `selfSignature`: kotlin.ByteArray, `statechainPublicKeys`: Map&lt;kotlin.String, kotlin.ByteArray>, `selfPublicKey`: kotlin.ByteArray, `verifyingKey`: kotlin.ByteArray, `adaptorPublicKey`: kotlin.ByteArray?): kotlin.ByteArray</ID>
     <ID>FunctionNaming:spark_frost.kt$@Throws(Exception::class) fun `applyAdaptorToSignature`(`pubKey`: kotlin.ByteArray, `hash`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `adaptorPrivateKey`: kotlin.ByteArray): kotlin.ByteArray</ID>
@@ -327,10 +327,10 @@
     <ID>FunctionParameterNaming:spark_frost.kt$`verifyingPubkey`: kotlin.ByteArray</ID>
     <ID>FunctionParameterNaming:spark_frost.kt$`vout`: kotlin.UInt</ID>
     <ID>InstanceOfCheckForException:spark_frost.kt$e is E</ID>
-    <ID>LongMethod:ClaimTransferService.kt$suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer)</ID>
+    <ID>LongMethod:ClaimTransferService.kt$internal suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer)</ID>
     <ID>LongMethod:LightningService.kt$suspend fun SparkWallet.payLightningInvoice(paymentRequest: String, amountSats: Long? = null, idempotencyKey: String? = null,): String</ID>
     <ID>LongMethod:SwapService.kt$internal suspend fun SparkWallet.processSwapBatch(leaves: List&lt;SparkLeaf>, targetAmounts: List&lt;Long>,): List&lt;SparkLeaf></ID>
-    <ID>LongMethod:TokenHashing.kt$fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray</ID>
+    <ID>LongMethod:TokenHashing.kt$internal fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean): ByteArray</ID>
     <ID>LongMethod:WithdrawalService.kt$suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long,): String</ID>
     <ID>LongParameterList:spark_frost.kt$(`nodeTx`: kotlin.ByteArray, `vout`: kotlin.UInt, `sequence`: kotlin.UInt, `paymentHash`: kotlin.ByteArray, `hashlockPubkey`: kotlin.ByteArray, `seqlockPubkey`: kotlin.ByteArray, `htlcSequence`: kotlin.UInt, `applyFee`: kotlin.Boolean, `feeSats`: kotlin.ULong, `network`: kotlin.String)</ID>
     <ID>LongParameterList:spark_frost.kt$UniffiLib$(`msg`: RustBuffer.ByValue,`statechainCommitments`: RustBuffer.ByValue,`selfCommitment`: RustBuffer.ByValue,`statechainSignatures`: RustBuffer.ByValue,`selfSignature`: RustBuffer.ByValue,`statechainPublicKeys`: RustBuffer.ByValue,`selfPublicKey`: RustBuffer.ByValue,`verifyingKey`: RustBuffer.ByValue,`adaptorPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, )</ID>

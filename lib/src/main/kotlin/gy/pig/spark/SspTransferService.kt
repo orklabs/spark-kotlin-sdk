@@ -2,9 +2,9 @@ package gy.pig.spark
 
 import org.json.JSONObject
 
-suspend fun SparkWallet.getTransferFromSsp(id: String): TransferWithUserRequest? = getTransfersFromSsp(ids = listOf(id)).firstOrNull()
+public suspend fun SparkWallet.getTransferFromSsp(id: String): TransferWithUserRequest? = getTransfersFromSsp(ids = listOf(id)).firstOrNull()
 
-suspend fun SparkWallet.getTransfersFromSsp(ids: List<String>): List<TransferWithUserRequest> {
+public suspend fun SparkWallet.getTransfersFromSsp(ids: List<String>): List<TransferWithUserRequest> {
     val response = sspClient.executeRaw(
         query = GraphQLQueries.GET_TRANSFERS,
         variables = mapOf("transfer_spark_ids" to ids),

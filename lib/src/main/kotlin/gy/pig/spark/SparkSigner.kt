@@ -20,54 +20,54 @@ package gy.pig.spark
  * @see SparkSigner
  * @see SparkWallet.fromSigner
  */
-interface SparkSignerProtocol {
+public interface SparkSignerProtocol {
     /** 33-byte compressed secp256k1 identity public key. Used as the wallet's address. */
-    val identityPublicKey: ByteArray
+    public val identityPublicKey: ByteArray
 
     /** 33-byte compressed secp256k1 public key for the default static deposit address. */
-    val depositPublicKey: ByteArray
+    public val depositPublicKey: ByteArray
 
     /** DER-encoded ECDSA signature over [messageHash] using the identity private key. */
-    fun signWithIdentityKey(messageHash: ByteArray): ByteArray
+    public fun signWithIdentityKey(messageHash: ByteArray): ByteArray
 
     /** Compact 64-byte (r||s) signature over [messageHash] using the identity private key. */
-    fun signCompactWithIdentityKey(messageHash: ByteArray): ByteArray
+    public fun signCompactWithIdentityKey(messageHash: ByteArray): ByteArray
 
     /**
      * Return the raw 32-byte identity private key. Only the SDK's ECIES decrypt path
      * for incoming transfer ciphers calls this; custom implementations may throw if
      * raw export is impossible.
      */
-    fun deriveIdentityPrivateKey(): ByteArray
+    public fun deriveIdentityPrivateKey(): ByteArray
 
     /** Return the deterministic FROST signing private key for the given Spark leaf id. */
-    fun deriveLeafSigningKey(leafID: String): ByteArray
+    public fun deriveLeafSigningKey(leafID: String): ByteArray
 
     /** Return the FROST signing key pair `(private, public)` for the given Spark leaf id. */
-    fun deriveLeafSigningKeyPair(leafID: String): Pair<ByteArray, ByteArray>
+    public fun deriveLeafSigningKeyPair(leafID: String): Pair<ByteArray, ByteArray>
 
     /** Return the secp256k1 private key for the [index]-th static deposit address. */
-    fun deriveStaticDepositKey(index: Int): ByteArray
+    public fun deriveStaticDepositKey(index: Int): ByteArray
 
     /** Return the 32-byte deterministic preimage for the given Spark transfer id. */
-    fun generatePreimage(transferID: String): ByteArray
+    public fun generatePreimage(transferID: String): ByteArray
 }
 
-class SparkSigner private constructor(private val keys: KeyDerivation,) : SparkSignerProtocol {
+public class SparkSigner private constructor(private val keys: KeyDerivation,) : SparkSignerProtocol {
 
-    companion object {
+    public companion object {
         /**
          * @param validateMnemonic Reject phrases that fail BIP-39 wordlist or checksum
          *   validation ([SparkError.InvalidMnemonic]). Defaults to `true`.
          */
-        fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = "", validateMnemonic: Boolean = true): SparkSigner =
+        public fun fromMnemonic(mnemonic: String, account: Int = 0, passphrase: String = "", validateMnemonic: Boolean = true): SparkSigner =
             SparkSigner(KeyDerivation.fromMnemonic(mnemonic, account, passphrase, validateMnemonic))
 
-        fun fromAccountKey(accountKey: ByteArray, accountChainCode: ByteArray): SparkSigner =
+        public fun fromAccountKey(accountKey: ByteArray, accountChainCode: ByteArray): SparkSigner =
             SparkSigner(KeyDerivation.fromAccountKey(accountKey, accountChainCode))
     }
 
-    fun exportAccountKey(): ByteArray = keys.accountKeyData + keys.accountChainCodeData
+    public fun exportAccountKey(): ByteArray = keys.accountKeyData + keys.accountChainCodeData
 
     override val identityPublicKey: ByteArray get() = keys.identityPublicKey
     override val depositPublicKey: ByteArray get() = keys.depositPublicKey

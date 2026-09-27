@@ -12,7 +12,7 @@ import spark.Spark
  * A leaf currently owned by the wallet, with its full TreeNode encoded for offline
  * use (raw node tx, pre-signed refund txs, verifying key, parent id).
  */
-data class SparkRecoveryLeaf(
+public data class SparkRecoveryLeaf(
     val id: String,
     val status: String,
     val valueSats: Long,
@@ -21,7 +21,7 @@ data class SparkRecoveryLeaf(
 )
 
 /** An ancestor node on the path from a leaf to its tree root. */
-data class SparkRecoveryNode(val id: String, val treeNodeHex: String,)
+public data class SparkRecoveryNode(val id: String, val treeNodeHex: String,)
 
 /**
  * Everything besides the seed needed to unilaterally exit the wallet's funds while
@@ -29,7 +29,7 @@ data class SparkRecoveryNode(val id: String, val treeNodeHex: String,)
  * operators are down, so this snapshot must be captured while they are online and
  * refreshed whenever the leaf set changes.
  */
-data class SparkRecoverySnapshot(
+public data class SparkRecoverySnapshot(
     /** "MAINNET" or "REGTEST" */
     val network: String,
     val identityPublicKeyHex: String,
@@ -56,7 +56,7 @@ private const val RECOVERY_MAX_MESSAGE_BYTES: Int = 128 * 1024 * 1024
  * NOT persist a snapshot from a failed call over a previous good one, because an
  * incomplete snapshot is useless for a unilateral exit.
  */
-suspend fun SparkWallet.getRecoverySnapshot(): SparkRecoverySnapshot {
+public suspend fun SparkWallet.getRecoverySnapshot(): SparkRecoverySnapshot {
     val stub = getCoordinatorStub()
         .withMaxInboundMessageSize(RECOVERY_MAX_MESSAGE_BYTES)
         .withMaxOutboundMessageSize(RECOVERY_MAX_MESSAGE_BYTES)

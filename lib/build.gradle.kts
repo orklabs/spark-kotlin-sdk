@@ -136,7 +136,13 @@ android {
 
 // -----------------------------------------------------------------------------
 // Kotlin — explicit API mode for the public surface.
-// Generated UniFFI / protobuf code is excluded via the source-set filter below.
+//
+// Warning, not Strict: the mode applies to the whole module, and the generated
+// UniFFI bindings (src/main/kotlin/gy/pig/spark/frost/, rewritten by
+// build-frost-android.sh) declare no visibility, so Strict would fail the build.
+// Every hand-written declaration states its visibility instead — the only
+// explicit-API warnings left come from spark_frost.kt — and
+// PublicApiHygieneTests fails on a top-level declaration without one.
 // -----------------------------------------------------------------------------
 kotlin {
     explicitApi = ExplicitApiMode.Warning

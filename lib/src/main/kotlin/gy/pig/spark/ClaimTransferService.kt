@@ -6,7 +6,7 @@ import kotlinx.coroutines.CancellationException
 import spark.Spark
 import uniffi.spark_frost.*
 
-suspend fun SparkWallet.queryPendingTransfers(): List<Spark.Transfer> {
+internal suspend fun SparkWallet.queryPendingTransfers(): List<Spark.Transfer> {
     val stub = getCoordinatorStub()
 
     val filter = Spark.TransferFilter.newBuilder()
@@ -88,7 +88,7 @@ internal fun SparkTransferClaim.claimedOrThrow(): Int {
  * is refused with [SparkError.UntrustedResponse] before any secret is decrypted or any refund
  * is signed.
  */
-suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
+internal suspend fun SparkWallet.claimTransfer(transfer: Spark.Transfer) {
     TransferLeafVerifier.verify(transfer, receiverIdentityPublicKey = signer.identityPublicKey)
 
     val stub = getCoordinatorStub()

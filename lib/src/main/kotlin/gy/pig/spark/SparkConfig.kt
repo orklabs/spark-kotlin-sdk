@@ -8,17 +8,17 @@ package gy.pig.spark
  * - [REGTEST] expects a local Spark deployment on `localhost:9001-9003`. Use it for
  *   integration tests and demos.
  */
-enum class SparkNetwork {
+public enum class SparkNetwork {
     MAINNET,
     REGTEST;
 
-    val networkString: String
+    public val networkString: String
         get() = when (this) {
             MAINNET -> "mainnet"
             REGTEST -> "regtest"
         }
 
-    val networkGraphQL: String
+    public val networkGraphQL: String
         get() = when (this) {
             MAINNET -> "MAINNET"
             REGTEST -> "REGTEST"
@@ -34,7 +34,7 @@ enum class SparkNetwork {
  * @property identityPublicKeyHex 33-byte compressed secp256k1 public key as a
  *   lowercase hex string, used to verify operator-signed responses.
  */
-data class SigningOperatorConfig(val address: String, val identifier: String, val identityPublicKeyHex: String,)
+public data class SigningOperatorConfig(val address: String, val identifier: String, val identityPublicKeyHex: String,)
 
 /**
  * Wallet-level configuration: network, operator topology, and SSP endpoint.
@@ -56,7 +56,7 @@ data class SigningOperatorConfig(val address: String, val identifier: String, va
  * @property expectedWithdrawRelativeBlockLocktime Relative block locktime the coordinator is
  *   expected to set on token outputs (reference SDK: 1 000).
  */
-data class SparkConfig(
+public data class SparkConfig(
     val network: SparkNetwork = SparkNetwork.MAINNET,
     val signingOperators: List<SigningOperatorConfig> = defaultOperators(network),
     val sspURL: String = "https://api.lightspark.com/graphql/spark/2025-03-19",
@@ -76,11 +76,11 @@ data class SparkConfig(
             SparkNetwork.REGTEST -> "022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe".hexToByteArray()
         }
 
-    companion object {
+    public companion object {
         /** The threshold the Spark deployments use for a given operator count (2 of 3, 3 of 5). */
-        fun defaultThreshold(operatorCount: Int): UInt = maxOf(2u, (maxOf(operatorCount, 0).toUInt() + 2u) / 2u)
+        internal fun defaultThreshold(operatorCount: Int): UInt = maxOf(2u, (maxOf(operatorCount, 0).toUInt() + 2u) / 2u)
 
-        fun defaultOperators(network: SparkNetwork): List<SigningOperatorConfig> = when (network) {
+        public fun defaultOperators(network: SparkNetwork): List<SigningOperatorConfig> = when (network) {
             SparkNetwork.MAINNET -> listOf(
                 SigningOperatorConfig(
                     address = "https://0.spark.lightspark.com",
