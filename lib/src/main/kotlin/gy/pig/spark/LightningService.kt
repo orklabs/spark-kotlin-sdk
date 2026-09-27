@@ -3,7 +3,10 @@ package gy.pig.spark
 import com.google.protobuf.ByteString
 import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import spark.Spark
 import uniffi.spark_frost.*
@@ -127,6 +130,11 @@ internal fun validateInvoiceRequest(amountSats: Long, memo: String?, expirySecs:
  * Pay a Lightning invoice via single-call `initiate_preimage_swap_v3` with a TransferPackage
  * (matching the JS reference SDK approach).
  *
+ * Once the coordinator is asked to lock the leaves, the send runs to completion even if the
+ * calling coroutine is cancelled: either the SSP request id is returned or
+ * [SparkError.LightningSendIncomplete] carries the transfer id, so a locked transfer is never
+ * left behind without it.
+ *
  * @param paymentRequest BOLT-11 invoice. Must be for the wallet's network
  *   ([SparkError.InvalidInvoice] otherwise).
  * @param maxFeeSats Highest routing fee the caller accepts. The SSP's fee estimate is fetched
@@ -136,8 +144,10 @@ internal fun validateInvoiceRequest(amountSats: Long, memo: String?, expirySecs:
  * @param idempotencyKey Optional key for deduplication. If the same key is used for multiple
  *   calls, the server returns the same result instead of creating duplicates.
  * @param transferId Optional UUID to make the whole send resumable. On
- *   [SparkError.LightningSendIncomplete] call again with the same id: the coordinator returns
- *   the transfer it already holds instead of locking more leaves.
+ *   [SparkError.LightningSendIncomplete] call again with the same id: when the coordinator
+ *   already holds a transfer with this id — ours, to the SSP, covering the invoice amount plus a
+ *   fee within [maxFeeSats] — the SDK goes straight back to the SSP without selecting or locking
+ *   any other leaves.
  * @return The SSP lightning send request id.
  */
 public suspend fun SparkWallet.payLightningInvoice(
@@ -147,25 +157,70 @@ public suspend fun SparkWallet.payLightningInvoice(
     idempotencyKey: String? = null,
     transferId: String? = null,
 ): String {
-    val payment = prepareLightningPayment(paymentRequest, maxFeeSats, amountSats, transferId)
-    val paymentHash = payment.invoice.paymentHash
-    val invoiceAmountSats = payment.amountSats
-    val feeSats = payment.feeSats
+    val payment = checkLightningPayment(paymentRequest, maxFeeSats, amountSats, transferId)
     val resumeTransferId = payment.resumeTransferId
 
+    // Resuming: a transfer the coordinator already holds under this id is the one an earlier call
+    // locked. Its leaves are TRANSFER_LOCKED, so selecting again would fail or swap other leaves.
+    if (resumeTransferId != null) {
+        val existing = queryTransferByIdOrNull(resumeTransferId)
+        if (canResumeLightningSend(existing, signer.identityPublicKey, config.sspIdentityPublicKey, payment.amountSats, maxFeeSats)) {
+            return requestLightningSend(lightningSendVariables(paymentRequest, idempotencyKey, resumeTransferId), resumeTransferId)
+        }
+    }
+
+    val feeSats = lightningSendFee(paymentRequest, payment, maxFeeSats)
     val stub = getCoordinatorStub()
-    val networkStr = config.network.networkString
 
     // Select leaves covering invoice amount + fee (with swap if needed)
-    val selectedLeaves = selectLeavesWithSwap(payment.totalNeeded)
-    val leafIDs = selectedLeaves.map { it.id }
+    val selectedLeaves = selectLeavesWithSwap(payment.amountSats + feeSats)
+    val soOperators = stub.getSigningOperatorList(Empty.getDefaultInstance()).signingOperatorsMap
+    val transferID = resumeTransferId ?: UUID.randomUUID().toString().lowercase()
 
-    val soListResponse = stub.getSigningOperatorList(Empty.getDefaultInstance())
-    val soOperators = soListResponse.signingOperatorsMap
+    val swapRequest = buildPreimageSwapRequest(
+        stub = stub,
+        paymentRequest = paymentRequest,
+        paymentHash = payment.invoice.paymentHash,
+        invoiceAmountSats = payment.amountSats,
+        feeSats = feeSats,
+        transferID = transferID,
+        selectedLeaves = selectedLeaves,
+        soOperators = soOperators,
+    )
 
+    // A caller-supplied transfer id doubles as the coordinator idempotency key, so a retry
+    // after a partial failure resumes the existing swap instead of starting a second one.
+    val coordinatorIdempotencyKey = idempotencyKey ?: resumeTransferId
+    val swapStub = if (coordinatorIdempotencyKey != null) getCoordinatorStubWithIdempotency(coordinatorIdempotencyKey) else stub
+
+    // Never start locking leaves for a caller that is already cancelled. From here on the send
+    // runs to completion regardless: the coordinator may lock the leaves as soon as it sees the
+    // request, and Swift's lightningSendIncomplete(transferId) contract needs the transfer id to
+    // reach the caller. Both calls are bounded (60 s RPC deadline, OkHttp timeouts).
+    currentCoroutineContext().ensureActive()
+    return withContext(NonCancellable) {
+        val swapResponse = swapStub.initiatePreimageSwapV3(swapRequest)
+        requestLightningSend(lightningSendVariables(paymentRequest, idempotencyKey, swapResponse.transfer.id), swapResponse.transfer.id)
+    }
+}
+
+/**
+ * Steps 1-4 of a lightning send, before anything is submitted: key tweaks and user-signed HTLC
+ * refunds in a TransferPackage, plus the regular cpfp refunds for the swap transfer field.
+ */
+private suspend fun SparkWallet.buildPreimageSwapRequest(
+    stub: spark.SparkServiceGrpcKt.SparkServiceCoroutineStub,
+    paymentRequest: String,
+    paymentHash: ByteArray,
+    invoiceAmountSats: Long,
+    feeSats: Long,
+    transferID: String,
+    selectedLeaves: List<SparkLeaf>,
+    soOperators: Map<String, Spark.SigningOperatorInfo>,
+): Spark.InitiatePreimageSwapRequest {
+    val networkStr = config.network.networkString
     // receiverIdentityPubkey = SSP identity public key (matching JS SDK)
     val receiverPubKey = config.sspIdentityPublicKey
-    val transferID = resumeTransferId ?: UUID.randomUUID().toString().lowercase()
 
     // Single shared expiry time — 16 days from now (matching JS SDK)
     val expiryTime = Timestamp.newBuilder()
@@ -186,7 +241,7 @@ public suspend fun SparkWallet.payLightningInvoice(
     // Step 3: Signing commitments and regular cpfp refunds for the swap transfer field
     val swapCommitmentsReq = Spark.GetSigningCommitmentsRequest.newBuilder()
         .setCount(3)
-        .addAllNodeIds(leafIDs)
+        .addAllNodeIds(selectedLeaves.map { it.id })
         .build()
     val swapCommitments = stub.getSigningCommitments(swapCommitmentsReq).signingCommitmentsList
     if (swapCommitments.size < selectedLeaves.size) {
@@ -199,7 +254,7 @@ public suspend fun SparkWallet.payLightningInvoice(
         networkStr = networkStr,
     )
 
-    // Step 4: initiate_preimage_swap_v3
+    // Step 4: the initiate_preimage_swap_v3 request
     val invoiceAmount = Spark.InvoiceAmount.newBuilder()
         .setValueSats(invoiceAmountSats)
         .setInvoiceAmountProof(Spark.InvoiceAmountProof.newBuilder().setBolt11Invoice(paymentRequest).build())
@@ -223,7 +278,7 @@ public suspend fun SparkWallet.payLightningInvoice(
         .setTransferPackage(transferPackage)
         .build()
 
-    val swapRequest = Spark.InitiatePreimageSwapRequest.newBuilder()
+    return Spark.InitiatePreimageSwapRequest.newBuilder()
         .setPaymentHash(ByteString.copyFrom(paymentHash))
         .setReason(Spark.InitiatePreimageSwapRequest.Reason.REASON_SEND)
         .setReceiverIdentityPublicKey(ByteString.copyFrom(receiverPubKey))
@@ -232,26 +287,6 @@ public suspend fun SparkWallet.payLightningInvoice(
         .setTransfer(transferField)
         .setTransferRequest(transferRequest)
         .build()
-
-    // A caller-supplied transfer id doubles as the coordinator idempotency key, so a retry
-    // after a partial failure resumes the existing swap instead of starting a second one.
-    val coordinatorIdempotencyKey = idempotencyKey ?: resumeTransferId
-    val swapStub = if (coordinatorIdempotencyKey != null) getCoordinatorStubWithIdempotency(coordinatorIdempotencyKey) else stub
-    val swapResponse = swapStub.initiatePreimageSwapV3(swapRequest)
-
-    // Step 5: SSP call with transfer external ID.
-    // SSP accepts either idempotency_key or user_outbound_transfer_external_id, not both.
-    // When an idempotency key is provided, use it; otherwise use the transfer external ID.
-    val sspVariables = mutableMapOf<String, Any>(
-        "encoded_invoice" to paymentRequest,
-    )
-    if (idempotencyKey != null) {
-        sspVariables["idempotency_key"] = idempotencyKey
-    } else {
-        sspVariables["user_outbound_transfer_external_id"] = swapResponse.transfer.id
-    }
-
-    return requestLightningSend(sspVariables, transferId = swapResponse.transfer.id)
 }
 
 /**
@@ -308,14 +343,11 @@ private suspend fun SparkWallet.buildHtlcTransferPackage(
     return transferPackageBuilder.build()
 }
 
-/** A lightning payment that passed every client-side check, ready to lock leaves for. */
-private class LightningPayment(val invoice: Bolt11Invoice, val amountSats: Long, val feeSats: Long, val totalNeeded: Long, val resumeTransferId: String?,)
+/** A lightning payment that passed the client-side checks that need no network call. */
+private class CheckedLightningPayment(val invoice: Bolt11Invoice, val amountSats: Long, val resumeTransferId: String?)
 
-/**
- * Everything `payLightningInvoice` checks before a leaf is touched: the fee cap, the invoice's
- * checksum, network and amount, the resume id, and the SSP's fee estimate against the cap.
- */
-private suspend fun SparkWallet.prepareLightningPayment(paymentRequest: String, maxFeeSats: Long, amountSats: Long?, transferId: String?,): LightningPayment {
+/** The fee cap, the invoice's checksum, network and amount, and the resume id — checked before any call is made. */
+private fun SparkWallet.checkLightningPayment(paymentRequest: String, maxFeeSats: Long, amountSats: Long?, transferId: String?): CheckedLightningPayment {
     if (maxFeeSats < 0) {
         throw SparkError.InvalidArgument("maxFeeSats must not be negative, got $maxFeeSats")
     }
@@ -327,50 +359,96 @@ private suspend fun SparkWallet.prepareLightningPayment(paymentRequest: String, 
         invoiceAmountMsat = invoice.amountMsat,
         requestedAmountSats = amountSats,
     )
-    val resumeTransferId = LightningValidator.normalizeTransferId(transferId)
+    return CheckedLightningPayment(invoice, invoiceAmountSats, LightningValidator.normalizeTransferId(transferId))
+}
 
-    // Get fee estimate from SSP and refuse anything above the caller's cap.
+/** The routing fee for a new send: the SSP's estimate (at least 1 sat), refused above the caller's cap. */
+private suspend fun SparkWallet.lightningSendFee(paymentRequest: String, payment: CheckedLightningPayment, maxFeeSats: Long): Long {
     val feeEstimate = getLightningSendFeeEstimate(
         encodedInvoice = paymentRequest,
-        amountSats = if (invoice.amountMsat == null) invoiceAmountSats else null,
+        amountSats = if (payment.invoice.amountMsat == null) payment.amountSats else null,
     )
     val feeSats = maxOf(feeEstimate, 1L)
     if (feeSats > maxFeeSats) {
         throw SparkError.FeeExceedsLimit(feeSats = feeSats, maxFeeSats = maxFeeSats)
     }
     // Both are positive, so the sum can only overflow past Long.MAX_VALUE.
-    if (invoiceAmountSats > Long.MAX_VALUE - feeSats) {
+    if (payment.amountSats > Long.MAX_VALUE - feeSats) {
         throw SparkError.InvalidArgument("amount plus fee overflows")
     }
-    return LightningPayment(
-        invoice = invoice,
-        amountSats = invoiceAmountSats,
-        feeSats = feeSats,
-        totalNeeded = invoiceAmountSats + feeSats,
-        resumeTransferId = resumeTransferId,
-    )
+    return feeSats
 }
 
 /**
- * The SSP half of a lightning send. By now the coordinator holds the leaves for [transferId]:
- * a failure is surfaced as [SparkError.LightningSendIncomplete] so the app can resume (same
- * `transferId`) or reconcile via the SSP.
+ * Whether [existing] — what the coordinator holds under a caller's resume `transferId` — is a
+ * lightning send this wallet already started for this payment, so the SSP step can be retried
+ * without touching any leaf. `null` (nothing under that id yet) means a new send.
+ *
+ * A transfer that is not an outgoing preimage swap from this wallet to the SSP, whose leaves were
+ * returned, or whose value does not cover the invoice amount plus a fee within [maxFeeSats] is
+ * refused: resuming it could only pay the wrong thing, and starting over under the same id would
+ * hand the coordinator's idempotency key to another request.
  */
-private suspend fun SparkWallet.requestLightningSend(variables: Map<String, Any>, transferId: String): String {
+internal fun canResumeLightningSend(
+    existing: Spark.Transfer?,
+    ownIdentityPublicKey: ByteArray,
+    sspIdentityPublicKey: ByteArray,
+    invoiceAmountSats: Long,
+    maxFeeSats: Long,
+): Boolean {
+    if (existing == null) return false
+    val id = existing.id
+    if (!existing.senderIdentityPublicKey.toByteArray().contentEquals(ownIdentityPublicKey) ||
+        !existing.receiverIdentityPublicKey.toByteArray().contentEquals(sspIdentityPublicKey) ||
+        existing.type != Spark.TransferType.PREIMAGE_SWAP
+    ) {
+        throw SparkError.InvalidArgument("transfer $id is not a lightning payment from this wallet; use a new transferId")
+    }
+    if (existing.status == Spark.TransferStatus.TRANSFER_STATUS_EXPIRED || existing.status == Spark.TransferStatus.TRANSFER_STATUS_RETURNED) {
+        throw SparkError.InvalidArgument("transfer $id is ${existing.status} and its leaves were returned; start a new payment with a new transferId")
+    }
+    // total_value is uint64: anything that reads as negative is far beyond any real payment.
+    val total = existing.totalValue
+    if (total < invoiceAmountSats) {
+        throw SparkError.InvalidArgument("transfer $id holds $total sats, less than the invoice amount of $invoiceAmountSats sats")
+    }
+    val feeSats = total - invoiceAmountSats
+    if (feeSats > maxFeeSats) {
+        throw SparkError.FeeExceedsLimit(feeSats = feeSats, maxFeeSats = maxFeeSats)
+    }
+    return true
+}
+
+/** The `request_lightning_send` variables: the SSP takes either an idempotency key or the transfer's external id, not both. */
+internal fun lightningSendVariables(paymentRequest: String, idempotencyKey: String?, transferId: String): Map<String, Any> = if (idempotencyKey != null) {
+    mapOf("encoded_invoice" to paymentRequest, "idempotency_key" to idempotencyKey)
+} else {
+    mapOf("encoded_invoice" to paymentRequest, "user_outbound_transfer_external_id" to transferId)
+}
+
+/** The SSP half of a lightning send: `request_lightning_send` for [transferId], see [completeLightningSend]. */
+private suspend fun SparkWallet.requestLightningSend(variables: Map<String, Any>, transferId: String): String = completeLightningSend(transferId) {
+    sspClient.executeRaw(query = GraphQLMutations.REQUEST_LIGHTNING_SEND, variables = variables)
+}
+
+/**
+ * Run the SSP step of a lightning send whose leaves the coordinator already holds under
+ * [transferId], to completion: it is not interrupted when the calling coroutine is cancelled,
+ * and any failure — including a response without a request id — is surfaced as
+ * [SparkError.LightningSendIncomplete] carrying the transfer id, so the app can resume (same
+ * `transferId`) or reconcile via the SSP. Swift reports a cancelled request the same way.
+ */
+internal suspend fun completeLightningSend(transferId: String, request: suspend () -> JSONObject): String = withContext(NonCancellable) {
     val sspResponse = try {
-        sspClient.executeRaw(
-            query = GraphQLMutations.REQUEST_LIGHTNING_SEND,
-            variables = variables,
-        )
-    } catch (e: CancellationException) {
-        // Unlike Swift (which reports any error here), cancellation is never swallowed in Kotlin:
-        // it must reach the caller's scope. The transfer can still be reconciled via the SSP.
-        throw e
-    } catch (e: Exception) {
+        request()
+    } catch (e: kotlin.Exception) {
+        // Spelled out: `uniffi.spark_frost.*` brings its own `Exception` (FROST errors only), which
+        // made 0.2.1 let SSP and transport failures escape without the transfer id. Includes
+        // CancellationException: nothing inside NonCancellable is cancelled by the caller, so one
+        // can only come from the request itself — and it must not lose the id either.
         throw SparkError.LightningSendIncomplete(transferId = transferId, reason = e.message ?: e.toString())
     }
-
-    return sspResponse.optJSONObject("request_lightning_send")
+    sspResponse.optJSONObject("request_lightning_send")
         ?.optJSONObject("request")
         ?.stringOrNull("id")
         ?: throw SparkError.LightningSendIncomplete(

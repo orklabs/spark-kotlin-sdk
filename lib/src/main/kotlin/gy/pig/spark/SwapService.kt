@@ -312,7 +312,11 @@ internal suspend fun SparkWallet.processSwapBatch(leaves: List<SparkLeaf>, targe
     return getLeaves()
 }
 
-internal suspend fun SparkWallet.queryTransferById(transferId: String): Spark.Transfer {
+internal suspend fun SparkWallet.queryTransferById(transferId: String): Spark.Transfer =
+    queryTransferByIdOrNull(transferId) ?: throw SparkError.InvalidResponse("Transfer not found: $transferId")
+
+/** The transfer with [transferId] in which this wallet takes part, or `null` when the coordinator has none. */
+internal suspend fun SparkWallet.queryTransferByIdOrNull(transferId: String): Spark.Transfer? {
     val stub = getCoordinatorStub()
     val filter = Spark.TransferFilter.newBuilder()
         .setSenderOrReceiverIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
@@ -320,8 +324,8 @@ internal suspend fun SparkWallet.queryTransferById(transferId: String): Spark.Tr
         .setNetwork(config.network.toProto())
         .build()
     val response = stub.queryAllTransfers(filter)
-    return response.transfersList.firstOrNull()
-        ?: throw SparkError.InvalidResponse("Transfer not found: $transferId")
+    // Only the transfer that was asked for (UUIDs compare case-insensitively).
+    return response.transfersList.firstOrNull { it.id.equals(transferId, ignoreCase = true) }
 }
 
 /**
