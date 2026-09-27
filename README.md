@@ -54,9 +54,13 @@
 
 - **Deposits** — one-time and reusable static taproot (P2TR) deposit addresses, with UTXO
   enumeration and claim flows.
-- **Lightning** — create BOLT-11 invoices, pay invoices, fee estimation.
+- **Lightning** — create BOLT-11 invoices, pay invoices with a fee cap, fee estimation,
+  resumable sends.
 - **Spark transfers** — send and receive between Spark wallets with sub-second finality.
-- **Withdrawals** — cooperative exit to any on-chain Bitcoin address.
+- **Withdrawals** — verified cooperative exit to any on-chain Bitcoin address, or drain
+  the whole wallet in one exit with `withdrawAll`.
+- **Verification** — the SSP's and the coordinator's responses are checked on the device
+  before anything is signed (see [Security model](#security-model)).
 - **Tokens** — create, mint, burn, transfer, and query Spark token balances.
 - **Swaps** — denominate leaves via the SSP swap service.
 - **Events** — `Flow<SparkEvent>` of incoming transfers and deposit confirmations.
@@ -88,14 +92,14 @@ The SDK ships precompiled `.so` libraries for `arm64-v8a`, `armeabi-v7a`, `x86`,
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("gy.pig:spark-kotlin-sdk:0.1.0")
+    implementation("gy.pig:spark-kotlin-sdk:0.2.1")
 }
 ```
 
 ```groovy
 // build.gradle
 dependencies {
-    implementation 'gy.pig:spark-kotlin-sdk:0.1.0'
+    implementation 'gy.pig:spark-kotlin-sdk:0.2.1'
 }
 ```
 
@@ -111,7 +115,9 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:main-SNAPSHOT")
+    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:v0.2.1")
+    // JNA's own guidance for Android: depend on the aar so libjnidispatch.so is packaged.
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
 }
 ```
 
@@ -151,9 +157,9 @@ runBlocking {
         val balance = wallet.getBalance()
         println("Available: ${balance.satsBalance.available} sats")
 
-        // 5. SEND — to another Spark wallet (33-byte compressed secp256k1 key).
+        // 5. SEND — to another Spark wallet, by its Spark address.
         val transfer = wallet.send(
-            receiverIdentityPublicKey = recipientPubKey,
+            receiverSparkAddress = "spark1...",
             amountSats = 500,
         )
         println("Sent: ${transfer.id}")
@@ -168,12 +174,17 @@ runBlocking {
 ### Creating a wallet
 
 ```kotlin
-// From a BIP-39 mnemonic (the most common case)
+// From a BIP-39 mnemonic (the most common case). The phrase is validated against the
+// English wordlist and its checksum; a typo throws SparkError.InvalidMnemonic instead of
+// silently opening a different, empty wallet.
 val wallet = SparkWallet.fromMnemonic(
     config = SparkConfig(),     // mainnet by default
     mnemonic = "...",
     account = 0,                // optional; defaults to 1 on mainnet, 0 on regtest
 )
+
+// Phrases known to be non-standard can skip validation.
+val legacy = SparkWallet.fromMnemonic(mnemonic = "...", validateMnemonic = false)
 
 // From a raw 64-byte account key (32-byte key + 32-byte chain code)
 val wallet = SparkWallet.fromAccountKey(
@@ -197,9 +208,13 @@ val utxos = wallet.getUtxosForDepositAddress(address = staticDeposit.address)
 
 // Once a UTXO confirms on-chain, claim it into your Spark balance
 val transferId = wallet.claimStaticDeposit(
-    txID = utxo.txid,
-    vout = utxo.vout,
+    transactionId = utxo.txid,
+    outputIndex = utxo.vout,
 )
+
+// One-time deposit addresses: the SDK locates the output that pays one of your unused
+// deposit addresses (pass `vout =` to insist on a specific output).
+wallet.claimDeposit(txID = txid)
 ```
 
 ### Lightning
@@ -211,16 +226,36 @@ val invoice = wallet.createLightningInvoice(
     memo = "Coffee",
 )
 
-// Send
+// Send. `maxFeeSats` is required: the SSP's fee estimate is refused (SparkError.FeeExceedsLimit)
+// if it is above the cap. Invoices for another network are refused.
 val fee = wallet.getLightningSendFeeEstimate(encodedInvoice = "lnbc...")
-val paymentId = wallet.payLightningInvoice(paymentRequest = "lnbc...")
+val paymentId = wallet.payLightningInvoice(paymentRequest = "lnbc...", maxFeeSats = fee)
+
+// Amountless invoices need an amount.
+val zeroAmountPaymentId = wallet.payLightningInvoice(
+    paymentRequest = "lnbc1...",
+    maxFeeSats = 20,
+    amountSats = 1_000,
+)
+
+// Make a send resumable: on SparkError.LightningSendIncomplete call again with the same
+// transferId and the coordinator resumes the existing transfer instead of locking a second
+// set of leaves.
+val transferId = java.util.UUID.randomUUID().toString()
+val resumable = wallet.payLightningInvoice(paymentRequest = "lnbc...", maxFeeSats = fee, transferId = transferId)
 ```
 
 ### Spark transfers
 
 ```kotlin
-// Pubkey form (33-byte compressed secp256k1)
+// Spark address form (bech32m, must be for the wallet's network)
 val transfer = wallet.send(
+    receiverSparkAddress = "spark1...",
+    amountSats = 500,
+)
+
+// Pubkey form (33-byte compressed secp256k1)
+val transfer2 = wallet.send(
     receiverIdentityPublicKey = "02abcd...".hexToByteArray(),
     amountSats = 500,
 )
@@ -232,11 +267,40 @@ val claimed: Int = wallet.claimAllPendingTransfers()
 ### Withdrawals
 
 ```kotlin
+// Exactly `amountSats` leaves the wallet; the SSP's fee is deducted from it. Leaves are
+// swapped to matching denominations first, so a partial withdrawal never overshoots.
 val l1Txid: String = wallet.withdraw(
     onChainAddress = "bc1q...",
     amountSats = 10_000,
+    maxFeeSats = 500,        // optional: refuse if the SSP quotes more (default: the quote itself)
 )
 ```
+
+Before anything is signed the SDK verifies the SSP's response: the exit transaction must
+hash to the reported txid, pay `onChainAddress` at least `amountSats - fee`, and the connector
+transaction must spend it. A response that fails throws `SparkError.UntrustedResponse` and no
+leaves are handed over. The connector refunds are then FROST-signed on the device and sent with
+the key tweaks in one `cooperative_exit_v2` call. Destination addresses may be P2PKH, P2SH,
+P2WPKH, P2WSH or P2TR and must belong to the wallet's network.
+
+To send everything, use `withdrawAll`. It claims pending transfers, renews what the operators
+will renew, exits every spendable leaf, and tells you what stayed behind:
+
+```kotlin
+val quote: WithdrawAllQuote = wallet.quoteWithdrawAll(onChainAddress = "bc1q...")
+// quote.spendableSats, quote.quotedFeeSats, quote.estimatedPayoutSats,
+// quote.frozenSats, quote.frozenFraction, quote.coversFee
+val result: WithdrawAllResult = wallet.withdrawAll(onChainAddress = "bc1q...", maxFeeSats = quote.quotedFeeSats)
+// result.txid, result.payoutSats, result.feeSats, result.frozenSats, result.lockedSats, result.unclaimedSats
+```
+
+The exited leaves stay transfer-locked, and therefore in `satsBalance.owned`, until the exit
+transaction confirms on-chain; `satsBalance.available` drops immediately.
+`satsBalance.frozen` reports sats in leaves at the timelock floor, which the operators will
+neither move nor renew and which only a unilateral exit can recover; `satsBalance.locked`
+reports sats held by in-flight operations. `getSpendableLeaves()` (and `SparkLeaf.isSpendable`
+/ `isRenewable`) is the leaf set every spend path selects from — use it or
+`satsBalance.available` for a "send everything" amount.
 
 ### Tokens
 
@@ -311,13 +375,17 @@ val custom = SparkConfig(
 | `SparkError.kt`               | Typed `sealed class` errors |
 | `SparkSigner.kt`              | Identity-key signing (`SparkSignerProtocol`) |
 | `KeyDerivation.kt`            | BIP-39 / BIP-32 derivation |
-| `GrpcConnectionManager.kt`    | gRPC channel management |
+| `GrpcConnectionManager.kt`, `AuthRetryInterceptor.kt` | gRPC channels: deadlines, retry policy, re-authenticate-and-replay |
 | `SspGraphQLClient.kt`         | SSP GraphQL transport + auth |
+| `BIP39.kt`, `BIP39Wordlist.kt` | Mnemonic validation |
+| `RawTransaction.kt`, `ByteReader.kt`, `BitcoinAddress.kt`, `Base58.kt`, `Bech32.kt`, `SparkAddress.kt` | Bounds-checked transaction parsing, address encoding/decoding |
 | `BalanceService.kt`           | Balance queries, leaf management |
 | `TransferService.kt`, `TransferQueryService.kt`, `ClaimTransferService.kt` | Spark-to-Spark send / claim / query |
-| `LightningService.kt`         | BOLT-11 invoice + payment |
+| `LightningService.kt`, `Bolt11Invoice.kt` | BOLT-11 decoding, invoice + payment |
 | `DepositService.kt`, `AddressService.kt` | One-time and static deposit addresses |
-| `WithdrawalService.kt`        | Cooperative on-chain exits |
+| `WithdrawalService.kt`, `CoopExitValidator.kt` | Verified cooperative on-chain exits, `withdrawAll` |
+| `TransferLeafVerifier.kt`, `TokenTransactionValidator.kt`, `DepositMatcher.kt` | Verification of inbound transfers, token commits, deposit outputs |
+| `RenewalService.kt`, `ConsolidationService.kt`, `RecoveryService.kt` | Leaf timelock renewal, consolidation, recovery snapshots |
 | `TokenService.kt`, `TokenIdentifier.kt`, `TokenHashing.kt` | Token create / mint / burn / transfer / query |
 | `SwapService.kt`              | SSP-mediated leaf denomination |
 | `EventService.kt`             | Real-time event streaming (`Flow<SparkEvent>`) |
@@ -334,7 +402,7 @@ All public APIs throw `SparkError` — a `sealed class` extending `Exception`:
 
 ```kotlin
 try {
-    wallet.payLightningInvoice(paymentRequest = "lnbc...")
+    wallet.payLightningInvoice(paymentRequest = "lnbc...", maxFeeSats = 50)
 } catch (e: SparkError) {
     when (e) {
         is SparkError.InsufficientBalance -> {
@@ -343,9 +411,26 @@ try {
         is SparkError.AuthenticationFailed -> {
             // re-auth flow
         }
+        is SparkError.FeeExceedsLimit -> {
+            // the SSP quoted ${e.feeSats} sats, more than ${e.maxFeeSats} — nothing was signed
+        }
+        is SparkError.UntrustedResponse -> {
+            // an SSP / coordinator response failed client-side verification — nothing was signed
+        }
+        is SparkError.LightningSendIncomplete -> {
+            // the coordinator holds the leaves; retry with the same transferId (${e.transferId})
+            // or reconcile via getTransferFromSsp
+        }
+        is SparkError.InvalidInvoice,
+        is SparkError.InvalidAddress,
+        is SparkError.InvalidMnemonic,
+        is SparkError.InvalidArgument -> {
+            // caller input problems
+        }
         is SparkError.GrpcError,
         is SparkError.GraphqlError,
-        is SparkError.FrostSigningFailed -> {
+        is SparkError.FrostSigningFailed,
+        is SparkError.MalformedTransaction -> {
             // transport / protocol failures
         }
         else -> {
@@ -354,6 +439,9 @@ try {
     }
 }
 ```
+
+gRPC status failures (for example a deadline after the default 60 s, once the retry policy
+is exhausted) surface as `io.grpc.StatusException`.
 
 ## Concurrency
 
@@ -380,6 +468,10 @@ This is a self-custody wallet SDK. **Read [SECURITY.md](SECURITY.md) before ship
 Highlights:
 
 - The host process is trusted — the SDK does not defend against a compromised app.
+- The SSP and the coordinator are **not** trusted blindly: withdrawals verify the exit
+  transaction before signing, inbound transfers verify the sender's signature before
+  claiming, token commits verify the coordinator's final transaction, created invoices are
+  checked against the requested hash and amount, and fees are capped by the caller.
 - Mnemonic and account-key storage is the **app's responsibility**. Use the
   [Android Keystore](https://developer.android.com/training/articles/keystore) with
   `setUserAuthenticationRequired(true)` for production wallets.
@@ -399,9 +491,18 @@ reporting on this repo or email `gm@orklabs.com`.
 ./gradlew :lib:testDebugUnitTest
 ```
 
-These cover key derivation, BIP-39 vectors, hex parsing, token validation, and
-deterministic helpers. They use the canonical `abandon abandon … about` BIP-39 test
-vector and require no configuration.
+These cover key derivation, BIP-39 vectors, raw-transaction parsing, address and BOLT-11
+decoding, the cooperative-exit, token, claim and operator checks, transport policy, and
+deterministic helpers — ported from the Swift SDK's offline suites with the same vectors.
+They require no configuration.
+
+A few of them exercise the FROST library (connector-refund sighashes, secret-share mapping,
+ECIES). The bundled `.so` files are Android-only, so those are skipped unless
+`SPARK_FROST_HOST_LIBRARY` points at a build of `spark-frost` for the host:
+
+```bash
+SPARK_FROST_HOST_LIBRARY=/path/to/libspark_frost.dylib ./gradlew :lib:testDebugUnitTest
+```
 
 ### Integration tests (live network, real funds)
 
