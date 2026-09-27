@@ -17,6 +17,74 @@ Nothing yet.
 
 ---
 
+## [0.2.2] — 2026-09-26
+
+Robustness fixes from an independent review of the 0.2.1 port. The withdraw path was not
+affected: it verifies the SSP's exit before signing, exactly like Swift.
+
+### Fixed
+- **One bad pending transfer no longer blocks every later claim** (also present in Swift).
+  `claimAllPendingTransfers` stopped at the first transfer it could not claim, so a malformed
+  or unverifiable inbound transfer left the rest unclaimed and their sats in `incoming`. Every
+  transfer is now attempted independently; cancellation still propagates at once.
+- **`LightningSendIncomplete` is actually raised.** In 0.2.1 the catch around the SSP step named
+  `Exception` in a file that star-imports `uniffi.spark_frost`, whose FROST error class is also
+  called `Exception`, so SSP and transport failures escaped without the transfer id. The same
+  shadowing is avoided in the new claim loop.
+- **Cancelling a lightning send no longer loses the transfer id.** From
+  `initiate_preimage_swap_v3` through the SSP request the send runs under `NonCancellable`
+  (both calls are bounded by the 60 s RPC deadline and OkHttp timeouts), after checking the
+  caller is still active. It ends with the SSP request id or with
+  `LightningSendIncomplete(transferId)`, which also becomes the failure of a cancelled
+  coroutine — Swift reports a cancelled SSP request the same way.
+- **Resuming a lightning send with `transferId` no longer selects leaves again** (also present
+  in Swift). Selection ran first, and failed or swapped other leaves because the originals are
+  locked in the transfer. The coordinator is now asked for the transfer under that id: an
+  outgoing preimage swap from this wallet to the SSP, not expired or returned, covering the
+  invoice amount plus a fee within `maxFeeSats`, goes straight back to `request_lightning_send`;
+  an id that belongs to anything else is refused (`InvalidArgument` / `FeeExceedsLimit`); no
+  transfer under the id means a new send.
+- **SSP amounts are parsed strictly** (Kotlin only). Fee estimates went through org.json's
+  `getLong`, which truncates `12.5`, parses the string `"12"` and saturates `1e19`, and
+  `(msat + 999) / 1000` could wrap to a negative fee that `maxOf(fee, 1)` turned into a 1-sat fee
+  slipping under `maxFeeSats`. Lightning and withdrawal fees, and the static-deposit quote's
+  `credit_amount_sats`, must now be whole non-negative JSON numbers (`InvalidResponse`
+  otherwise; a whole value written as `1500.0` counts, as with Swift's exact `as? Int64`), with
+  `Math.addExact` for rounding and sums (`UntrustedResponse` on overflow).
+- **DER signatures with an integer missing its 0x00 sign pad are rejected** when verifying
+  inbound leaves, as libsecp256k1 does (BouncyCastle's `positiveValue` read them as valid).
+
+### Added
+- `claimPendingTransfers(): SparkTransferClaim` — `pending`, `claimed` and
+  `failures: List<SparkTransferClaimFailure>` (`transferId`, `error`) — for a per-transfer
+  report without an exception. `withdrawAll` / `quoteWithdrawAll` claim through it.
+- `PublicApiHygieneTests`, which fails when a hand-written top-level declaration has no
+  visibility modifier, and pins the spend internals as internal.
+
+### Changed
+- `claimAllPendingTransfers(): Int` keeps its signature. When any claim failed it rethrows the
+  first failure *after* attempting every transfer (later failures attached as suppressed
+  exceptions), so existing catch blocks see the same exception types.
+- **Breaking (API hygiene):** declarations the Swift SDK keeps internal are internal:
+  `queryPendingTransfers`, `claimTransfer`, `selectLeavesWithSwap`, `requestLeavesSwap`,
+  `tryExactSelection`, `computeNextSequences`, `timelockCanDecrement`, `parseSequenceFromRawTx`,
+  `FrostSigningHelper`, `KeyDerivation` / `DerivedKey`, `GrpcConnectionManager`,
+  `SparkAuthenticator`, `SspAuthenticator`, `SspGraphQLClient` / `executeGraphQL`,
+  `GraphQLMutations` / `GraphQLQueries`, `SparkHasher`, `subtractPrivateKeys`, `sha256`,
+  `hmacSHA256`, `hmacSHA512`, `decodeBase64URL`, `parseISODate`, `String.hexToByteArray`,
+  `ByteArray.toHexString`, `hashTokenTransactionV2`, `hashOperatorSpecificPayload`,
+  `TokenIdentifierPrefix`, the `SPARK_*` constants and `SparkConfig.defaultThreshold`.
+  *Migration:* use the documented operations (`claimAllPendingTransfers` /
+  `claimPendingTransfers`, `send`, `withdraw`, `payLightningInvoice`, ...) and your own hex
+  helper. piggy-android uses none of these.
+- Every hand-written declaration states its visibility. Explicit API mode stays at `Warning`:
+  it is module-wide and the generated UniFFI bindings declare no visibility, so `Strict` would
+  fail the build; the only warnings left are in `spark_frost.kt`.
+- `org.json:json` is a test-only dependency (Android's `org.json` is a throwing stub in JVM unit
+  tests); it is not part of the published POM.
+
+---
+
 ## [0.2.1] — 2026-09-26
 
 Brings the Kotlin SDK level with spark-swift-sdk 0.2.1. The Kotlin SDK was not tagged at
@@ -205,7 +273,8 @@ Initial public release.
   `build-frost-android.sh`. PRs that update the binaries must include a SHA-256 hash
   and the upstream commit they were built from.
 
-[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.1.0...v0.2.1
 [0.2.0]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/compare/v0.1.0...v0.2.1
 [0.1.0]: https://github.com/p-i-g-g-y/spark-kotlin-sdk/releases/tag/v0.1.0

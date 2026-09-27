@@ -92,14 +92,14 @@ The SDK ships precompiled `.so` libraries for `arm64-v8a`, `armeabi-v7a`, `x86`,
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("gy.pig:spark-kotlin-sdk:0.2.1")
+    implementation("gy.pig:spark-kotlin-sdk:0.2.2")
 }
 ```
 
 ```groovy
 // build.gradle
 dependencies {
-    implementation 'gy.pig:spark-kotlin-sdk:0.2.1'
+    implementation 'gy.pig:spark-kotlin-sdk:0.2.2'
 }
 ```
 
@@ -115,7 +115,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:v0.2.1")
+    implementation("com.github.p-i-g-g-y:spark-kotlin-sdk:v0.2.2")
     // JNA's own guidance for Android: depend on the aar so libjnidispatch.so is packaged.
     implementation("net.java.dev.jna:jna:5.17.0@aar")
 }
@@ -239,11 +239,16 @@ val zeroAmountPaymentId = wallet.payLightningInvoice(
 )
 
 // Make a send resumable: on SparkError.LightningSendIncomplete call again with the same
-// transferId and the coordinator resumes the existing transfer instead of locking a second
-// set of leaves.
+// transferId. If the coordinator already holds that transfer (ours, to the SSP, covering the
+// invoice plus a fee within maxFeeSats) the SDK goes straight back to the SSP without selecting
+// or locking any other leaves.
 val transferId = java.util.UUID.randomUUID().toString()
 val resumable = wallet.payLightningInvoice(paymentRequest = "lnbc...", maxFeeSats = fee, transferId = transferId)
 ```
+
+Once the coordinator has been asked to lock the leaves, a send runs to completion even if the
+calling coroutine is cancelled: it ends with the SSP request id or with
+`SparkError.LightningSendIncomplete(transferId)`, never with the transfer id lost.
 
 ### Spark transfers
 
@@ -254,14 +259,20 @@ val transfer = wallet.send(
     amountSats = 500,
 )
 
-// Pubkey form (33-byte compressed secp256k1)
+// Pubkey form (33-byte compressed secp256k1 identity key)
 val transfer2 = wallet.send(
-    receiverIdentityPublicKey = "02abcd...".hexToByteArray(),
+    receiverIdentityPublicKey = recipientIdentityKey,   // ByteArray(33)
     amountSats = 500,
 )
 
-// Receive side: claim any pending inbound transfers
+// Receive side: claim pending inbound transfers. Each one is claimed independently, so a
+// transfer that fails verification does not block the rest; if any failed, the first failure
+// is rethrown after all were attempted.
 val claimed: Int = wallet.claimAllPendingTransfers()
+
+// Or get a per-transfer report without an exception:
+val report: SparkTransferClaim = wallet.claimPendingTransfers()
+// report.pending, report.claimed, report.failures (transferId + error each)
 ```
 
 ### Withdrawals
