@@ -128,8 +128,10 @@ before any key material is used:
   must be addressed to this wallet (a multi-receiver transfer is narrowed to this wallet's
   leaves), before any secret is decrypted or refund signed.
 - **Token transactions** — the coordinator's final transaction must equal the
-  submitted partial transaction apart from server-set fields, with the expected
-  withdraw bond and locktime and a keyshare naming the configured operators.
+  submitted partial transaction apart from server-set fields: for V2, with the expected
+  withdraw bond and locktime and a keyshare naming the configured operators; for V3, the
+  signed partial transaction plus a revocation commitment per output, so the hash the SDK
+  reports is that of the transaction it signed.
 - **Operators** — secret shares are only ever encrypted to operator identity keys from
   the local configuration; a coordinator operator list that does not match the
   configuration is refused.

@@ -88,10 +88,9 @@ class TokenTransactionValidationTests {
         Spark.SigningKeyshare.newBuilder().addAllOwnerIdentifiers(owners).setThreshold(threshold).build()
 
     @Test
-    fun anHonestFinalTransactionPassesWithAndWithoutKeyshareInfo() {
+    fun anHonestFinalTransactionPasses() {
         val partial = partialTransfer()
         val final = finalize(partial)
-        TokenTransactionValidator.validate(final, partial, keyshareInfo = null, expectations = expectations)
         TokenTransactionValidator.validate(final, partial, keyshareInfo = keyshare(), expectations = expectations)
 
         // Mint and create transactions too.
@@ -104,7 +103,7 @@ class TokenTransactionValidationTests {
             .clearTokenOutputs()
             .addTokenOutputs(output(owner, 1_000))
             .build()
-        TokenTransactionValidator.validate(finalize(mint), mint, keyshareInfo = null, expectations = expectations)
+        TokenTransactionValidator.validate(finalize(mint), mint, keyshareInfo = keyshare(), expectations = expectations)
 
         val createInput = TokenCreateInput.newBuilder()
             .setIssuerPublicKey(owner.toByteString())
@@ -122,7 +121,7 @@ class TokenTransactionValidationTests {
                     .setCreationEntityPublicKey((byteArrayOf(0x02) + bytes(0x77, 32)).toByteString()), // server-set
             )
             .build()
-        TokenTransactionValidator.validate(finalCreate, create, keyshareInfo = null, expectations = expectations)
+        TokenTransactionValidator.validate(finalCreate, create, keyshareInfo = keyshare(), expectations = expectations)
     }
 
     @Test
@@ -133,7 +132,7 @@ class TokenTransactionValidationTests {
         fun expectRejected(label: String, mutate: TokenTransaction.Builder.() -> Unit) {
             val final = honest.toBuilder().apply(mutate).build()
             val error = expectSparkError(label) {
-                TokenTransactionValidator.validate(final, partial, keyshareInfo = null, expectations = expectations)
+                TokenTransactionValidator.validate(final, partial, keyshareInfo = keyshare(), expectations = expectations)
             }
             assertEquals(label, SparkError.UntrustedResponse::class, error::class)
         }
@@ -171,9 +170,32 @@ class TokenTransactionValidationTests {
         expectRejected("type changed") {
             setMintInput(TokenMintInput.newBuilder().setIssuerPublicKey(owner.toByteString()).setTokenIdentifier(tokenId.toByteString()))
         }
+        expectRejected("client timestamp moved a millisecond") {
+            clientCreatedTimestamp = clientCreatedTimestamp.toBuilder().setNanos(clientCreatedTimestamp.nanos + 1_000_000).build()
+        }
+        expectRejected("client timestamp removed") { clearClientCreatedTimestamp() }
         expectRejected("invoice attachment added") {
             addInvoiceAttachments(InvoiceAttachment.newBuilder().setSparkInvoice("spark1..."))
         }
+    }
+
+    @Test
+    fun aStartAnswerWithoutKeyshareInfoIsRefusedAsTheReferenceSdkRefusesIt() {
+        val partial = partialTransfer()
+        val final = finalize(partial)
+        val error = expectSparkError { TokenTransactionValidator.validate(final, partial, keyshareInfo = null, expectations = expectations) }
+        assertEquals(SparkError.UntrustedResponse::class, error::class)
+    }
+
+    @Test
+    fun theClientTimestampIsComparedToTheMillisecondThePrecisionTheHashCovers() {
+        val partial = partialTransfer()
+        val honest = finalize(partial)
+        // Microseconds the V2 hash does not cover may differ.
+        val final = honest.toBuilder()
+            .setClientCreatedTimestamp(honest.clientCreatedTimestamp.toBuilder().setNanos(honest.clientCreatedTimestamp.nanos + 999_000))
+            .build()
+        TokenTransactionValidator.validate(final, partial, keyshareInfo = keyshare(), expectations = expectations)
     }
 
     @Test

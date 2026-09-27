@@ -254,8 +254,8 @@ class TokenTests {
         try {
             selectTokenOutputs(outputs, BigInteger.ZERO, TokenOutputSelectionStrategy.SMALL_FIRST)
             fail("Should have thrown for zero amount")
-        } catch (e: IllegalArgumentException) {
-            // expected (Kotlin uses require(); Swift throws SparkError.tokenValidationFailed)
+        } catch (e: SparkError.TokenValidationFailed) {
+            // expected
         }
     }
 
@@ -480,7 +480,7 @@ class TokenTests {
                 isFreezable = false,
             )
             fail("Should have thrown for name too long")
-        } catch (e: IllegalArgumentException) {
+        } catch (e: SparkError.TokenValidationFailed) {
             // expected
         }
     }
@@ -496,7 +496,7 @@ class TokenTests {
                 isFreezable = false,
             )
             fail("Should have thrown for empty name")
-        } catch (e: IllegalArgumentException) {
+        } catch (e: SparkError.TokenValidationFailed) {
             // expected
         }
     }
@@ -512,7 +512,7 @@ class TokenTests {
                 isFreezable = false,
             )
             fail("Should have thrown for ticker too long")
-        } catch (e: IllegalArgumentException) {
+        } catch (e: SparkError.TokenValidationFailed) {
             // expected
         }
     }
@@ -528,7 +528,7 @@ class TokenTests {
                 isFreezable = false,
             )
             fail("Should have thrown for decimals > 255")
-        } catch (e: IllegalArgumentException) {
+        } catch (e: SparkError.TokenValidationFailed) {
             // expected
         }
     }
@@ -540,8 +540,107 @@ class TokenTests {
         try {
             wallet.mintTokens(tokenIdentifier = fakeTokenId, tokenAmount = BigInteger.ZERO)
             fail("Should have thrown for zero amount")
-        } catch (e: IllegalArgumentException) {
+        } catch (e: SparkError.TokenValidationFailed) {
             // expected
         }
+    }
+}
+
+/**
+ * Token balances against the operator stand-in, which refuses metadata queries for more than 500
+ * tokens as the operators do. Port of the Swift SDK's `TokenBalanceTests`.
+ */
+class TokenBalanceTests {
+    private fun outputs(kinds: Int): List<OutputWithPreviousTransactionData> = (0 until kinds).map { index ->
+        OutputWithPreviousTransactionData.newBuilder()
+            .setOutput(
+                TokenOutput.newBuilder()
+                    .setTokenIdentifier((ByteArray(28) + java.nio.ByteBuffer.allocate(4).putInt(index).array()).toByteString())
+                    .setTokenAmount(encodeUInt128(BigInteger.ONE).toByteString())
+                    .setStatus(spark_token.TokenOutputStatus.TOKEN_OUTPUT_STATUS_AVAILABLE),
+            )
+            .build()
+    }
+
+    @Test(timeout = 60_000)
+    fun metadataIsAskedFor500TokensAtATimeSoAnyNumberOfTokensCanBeListed() = runBlocking {
+        val state = FakeOperatorState { false }
+        state.setTokenOutputs(outputs(kinds = 1_200))
+        val balances = withFakeOperator(state) { it.getTokenBalances() }
+        assertEquals(1_200, balances.size)
+        assertTrue(balances.all { it.ownedBalance == BigInteger.ONE && it.availableToSendBalance == BigInteger.ONE })
+        assertEquals(listOf(500, 500, 200), state.metadataRequestSizes)
+    }
+
+    @Test(timeout = 60_000)
+    fun tokensThatCannotBeReadFailGetTokenBalances() = runBlocking {
+        val state = FakeOperatorState { false }
+        state.setTokenOutputs(outputs(kinds = 3))
+        state.failsTokenMetadata = true
+        withFakeOperator(state) { wallet ->
+            expectGrpcFailure { wallet.getTokenBalances() }
+            // getBalance keeps the sats: see BalanceSummaryTests.
+            assertTrue(wallet.getBalance().tokenBalances.isEmpty())
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun onlyAvailableOutputsAreAvailableToSend() = runBlocking {
+        val state = FakeOperatorState { false }
+        state.setTokenOutputs(
+            outputs(kinds = 1) + outputs(kinds = 1).map {
+                it.toBuilder().setOutput(it.output.toBuilder().setStatus(spark_token.TokenOutputStatus.TOKEN_OUTPUT_STATUS_PENDING_OUTBOUND)).build()
+            },
+        )
+        val balance = withFakeOperator(state) { it.getTokenBalances() }.single()
+        assertEquals(BigInteger.TWO, balance.ownedBalance)
+        assertEquals(BigInteger.ONE, balance.availableToSendBalance)
+    }
+}
+
+/**
+ * `createToken`'s checks, ported from the reference SDK's `token-create.test.ts`, with the
+ * operators' NFC rule (`TokenMetadata.ValidatePartial`). Port of the Swift SDK's
+ * `TokenCreationParameterTests`.
+ */
+class TokenCreationParameterTests {
+    private fun validate(name: String, ticker: String, decimals: UInt = 0u, extra: ByteArray? = null) =
+        validateTokenParameters(tokenName = name, tokenTicker = ticker, decimals = decimals, extraMetadata = extra)
+
+    @Test
+    fun accepted() {
+        for ((name, ticker) in listOf(
+            "abc" to "AAA", // shortest name
+            "12345678901234567890" to "AAA", // longest name
+            "Token" to "ABC", // shortest ticker
+            "Token" to "ABCDEF", // longest ticker
+            "ABCDEFGHIJKLMNOPQ" to "AAA",
+            "Tok🚀n" to "TOK", // 8 bytes: the rocket is 4
+            "Café" to "ÉCU", // precomposed é and É: NFC
+        )) {
+            validate(name, ticker)
+        }
+    }
+
+    @Test
+    fun refused() {
+        for ((name, ticker) in listOf(
+            "ab" to "AAA", // name too short
+            "123456789012345678901" to "AAA", // name too long
+            "Token" to "AB", // ticker too short
+            "Token" to "ABCDEFG", // ticker too long
+            "Café" to "TOK", // e + combining acute: not NFC
+            "Token" to "ÉCU", // ticker not NFC
+        )) {
+            val error = expectSparkError("$name / $ticker") { validate(name, ticker) }
+            assertTrue(error.toString(), error is SparkError.TokenValidationFailed)
+        }
+    }
+
+    @Test
+    fun decimalsUpTo255AndExtraMetadataUpTo1024Bytes() {
+        validate("Token", "TOK", decimals = 255u, extra = ByteArray(1024))
+        expectSparkError { validate("Token", "TOK", decimals = 256u) }
+        expectSparkError { validate("Token", "TOK", extra = ByteArray(1025)) }
     }
 }

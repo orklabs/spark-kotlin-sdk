@@ -67,6 +67,12 @@ public class SparkWallet private constructor(public val config: SparkConfig, pub
     /** Running event streams, stopped by [close]. */
     internal val eventStreams = EventStreamRegistry()
 
+    /** Token outputs picked by sends that may still be in flight. */
+    internal val tokenOutputLocks = TokenOutputLocks()
+
+    /** Token transfers sent with an idempotency key, resent as first built on a retry. */
+    internal val tokenTransferAttempts = TokenTransferAttempts()
+
     // Every operator channel re-issues a call the operator rejects as UNAUTHENTICATED with a fresh
     // token (the official SDK's auth middleware), dropping the rejected token only if it is still
     // the cached one; the innermost interceptor feeds the operators' clock from their answers.

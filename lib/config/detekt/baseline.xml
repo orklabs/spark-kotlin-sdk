@@ -361,7 +361,6 @@
     <ID>TooGenericExceptionThrown:spark_frost.kt$throw RuntimeException("UniFFI contract version mismatch: try cleaning and rebuilding your project")</ID>
     <ID>UnusedImports:spark_frost.kt$import com.sun.jna.IntegerType</ID>
     <ID>UnusedParameter:DepositService.kt$network: String</ID>
-    <ID>UnusedParameter:TokenService.kt$revocationCommitments: List&lt;ByteArray>?</ID>
     <ID>UnusedPrivateProperty:WithdrawalService.kt$j</ID>
     <ID>VariableNaming:spark_frost.kt$UniffiRustCallStatus$@JvmField var error_buf: RustBuffer.ByValue = RustBuffer.ByValue()</ID>
     <ID>VariableNaming:spark_frost.kt$val bindings_contract_version = 26</ID>

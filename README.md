@@ -341,12 +341,24 @@ val token = wallet.createToken(
     maxSupply = BigInteger.valueOf(1_000_000),
     isFreezable = false,
 )
-wallet.mintTokens(
-    tokenIdentifier = token.tokenIdentifier!!,
-    tokenAmount = BigInteger.valueOf(1_000),
-)
+val tokenIdentifier = requireNotNull(token.tokenIdentifier)
+wallet.mintTokens(tokenIdentifier = tokenIdentifier, tokenAmount = BigInteger.valueOf(1_000))
 val balances = wallet.getTokenBalances()
+
+// Retrying with the same key resends the transaction the first call built: at most one transfer.
+wallet.transferTokens(
+    tokenIdentifier = tokenIdentifier,
+    tokenAmount = BigInteger.valueOf(250),
+    receiverSparkAddress = "spark1...",
+    idempotencyKey = "order-42",
+)
 ```
+
+Token transactions use the operators' V3 format, as the reference SDK does: one
+`broadcast_transaction` call, signed over the protohash of the partial transaction.
+`SparkConfig(tokenTransactionVersion = TokenTransactionVersion.V2)` keeps the older two-step flow
+while the operators accept it. Sends from one wallet never pick the same outputs: an output a send
+picked stays locked for 30 s, or until the operators report it pending.
 
 ### Events & history
 

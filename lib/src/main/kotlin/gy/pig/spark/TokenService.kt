@@ -4,12 +4,24 @@ import com.google.protobuf.ByteString
 import com.google.protobuf.Timestamp
 import spark_token.*
 import java.math.BigInteger
+import java.text.Normalizer
 
 private const val QUERY_TOKEN_OUTPUTS_PAGE_SIZE = 100
 private const val MAX_TOKEN_OUTPUTS_TX = 500
 
 // MARK: - Public Token API
 
+/**
+ * Transfer tokens to a receiver's Spark address. A Spark invoice is refused with
+ * [SparkError.InvalidAddress], as in `send(receiverSparkAddress, amountSats)`.
+ *
+ * @param idempotencyKey Makes retries safe. A retry with the same key, on the same wallet,
+ *   resends the transaction the first call built, so the transfer is made at most once: a retry
+ *   after it went through returns its hash again, and a retry after it failed completes it if it
+ *   can still be sent, else fails again. A key used for another token, amount or receiver is
+ *   refused with [SparkError.InvalidArgument]. The wallet remembers the last 1,000 keys; use a
+ *   new key for a new transfer.
+ */
 public suspend fun SparkWallet.transferTokens(
     tokenIdentifier: Bech32mTokenIdentifier,
     tokenAmount: BigInteger,
@@ -21,28 +33,47 @@ public suspend fun SparkWallet.transferTokens(
     // The receiver's identity key, from a Spark address for this network (a Spark invoice is
     // refused), before any output is fetched.
     val receiverData = SparkAddress.decode(receiverSparkAddress, config.network)
+    val request = TokenTransferAttempts.Request(
+        tokenIdentifier = ByteString.copyFrom(rawTokenId),
+        amount = tokenAmount,
+        receiverIdentityPublicKey = ByteString.copyFrom(receiverData),
+    )
 
-    val outputs = fetchTokenOutputs(tokenIdentifiers = listOf(rawTokenId))
-    if (outputs.isEmpty()) {
-        throw SparkError.InsufficientTokenBalance(token = tokenIdentifier, need = "$tokenAmount", have = "0")
+    val earlier = idempotencyKey?.let { tokenTransferAttempts.attempt(it) }
+    val attempt = if (earlier != null) {
+        if (earlier.request != request) {
+            throw SparkError.InvalidArgument("idempotency key $idempotencyKey was used for a different token transfer")
+        }
+        earlier
+    } else {
+        newTokenTransfer(request, tokenIdentifier, strategy).also { attempt ->
+            idempotencyKey?.let { tokenTransferAttempts.remember(attempt, it) }
+        }
     }
 
-    val selected = selectTokenOutputs(outputs, tokenAmount, strategy)
+    return sendTokenTransaction(attempt.transaction, spentOutputs = attempt.spentOutputs, idempotencyKey = idempotencyKey).transactionHash
+}
 
-    val tx = buildTransferTokenTransaction(
-        selectedOutputs = selected,
-        receiverOutputs = listOf(Triple(receiverData, rawTokenId, tokenAmount)),
-        changeOwnerPubKey = signer.identityPublicKey,
-    )
+/** Picks outputs for [request] and builds its transaction, with change back to the wallet. */
+private suspend fun SparkWallet.newTokenTransfer(
+    request: TokenTransferAttempts.Request,
+    tokenIdentifier: Bech32mTokenIdentifier,
+    strategy: TokenOutputSelectionStrategy,
+): TokenTransferAttempts.Attempt {
+    val outputs = fetchTokenOutputs(tokenIdentifiers = listOf(request.tokenIdentifier.toByteArray()))
+    if (outputs.isEmpty()) {
+        throw SparkError.InsufficientTokenBalance(token = tokenIdentifier, need = "${request.amount}", have = "0")
+    }
 
-    return broadcastTokenTransactionV2(
-        tokenTransaction = tx,
-        signingPublicKeys = selected.map { it.output.ownerPublicKey.toByteArray() },
-        revocationCommitments = selected.mapNotNull {
-            if (it.output.hasRevocationCommitment()) it.output.revocationCommitment.toByteArray() else null
-        },
-        idempotencyKey = idempotencyKey,
+    // Only available outputs no other send from this wallet has picked (see TokenOutputLocks).
+    val selected = tokenOutputLocks.acquire(outputs) { selectTokenOutputs(it, request.amount, strategy) }
+
+    val receiver = TokenOutputSpec(owner = request.receiverIdentityPublicKey, tokenIdentifier = request.tokenIdentifier, amount = request.amount)
+    val draft = transferDraft(
+        spent = selected,
+        outputs = transferOutputs(spent = selected, receivers = listOf(receiver), changeOwner = ByteString.copyFrom(signer.identityPublicKey)),
     )
+    return TokenTransferAttempts.Attempt(request = request, transaction = draft, spentOutputs = selected)
 }
 
 public suspend fun SparkWallet.getTokenBalances(): List<TokenBalance> {
@@ -53,9 +84,7 @@ public suspend fun SparkWallet.getTokenBalances(): List<TokenBalance> {
         val tokenId = output.output.tokenIdentifier
         val amount = decodeUInt128(output.output.tokenAmount)
         val (owned, available) = balancesByToken[tokenId] ?: (BigInteger.ZERO to BigInteger.ZERO)
-        val isAvailable = !output.output.hasStatus() ||
-            output.output.status == TokenOutputStatus.TOKEN_OUTPUT_STATUS_AVAILABLE
-        balancesByToken[tokenId] = (owned + amount) to (if (isAvailable) available + amount else available)
+        balancesByToken[tokenId] = (owned + amount) to (if (TokenOutputLocks.isAvailable(output)) available + amount else available)
     }
 
     val tokenIds = balancesByToken.keys.map { it.toByteArray() }
@@ -127,6 +156,13 @@ public suspend fun SparkWallet.queryTokenMetadata(
 
 // MARK: - Token Issuance
 
+/**
+ * Create a new token on Spark. The caller's identity key becomes the issuer.
+ *
+ * The parameters are checked as the operators check them: the name 3–20 and the ticker 3–6
+ * UTF-8 bytes, both in Unicode normalization form C; decimals up to 255; extra metadata up to
+ * 1024 bytes. A token that breaks them is refused with [SparkError.TokenValidationFailed].
+ */
 public suspend fun SparkWallet.createToken(
     tokenName: String,
     tokenTicker: String,
@@ -135,17 +171,10 @@ public suspend fun SparkWallet.createToken(
     isFreezable: Boolean,
     extraMetadata: ByteArray? = null,
 ): TokenCreationResult {
-    val nameBytes = tokenName.toByteArray(Charsets.UTF_8)
-    require(nameBytes.isNotEmpty() && nameBytes.size <= 20) { "Token name must be 1-20 UTF-8 bytes" }
-    val tickerBytes = tokenTicker.toByteArray(Charsets.UTF_8)
-    require(tickerBytes.isNotEmpty() && tickerBytes.size <= 6) { "Token ticker must be 1-6 UTF-8 bytes" }
-    require(decimals <= 255u) { "Decimals must be <= 255" }
-    extraMetadata?.let { require(it.size <= 1024) { "Extra metadata must be <= 1024 bytes" } }
-
-    val issuerPubKey = signer.identityPublicKey
+    validateTokenParameters(tokenName, tokenTicker, decimals, extraMetadata)
 
     val createInput = TokenCreateInput.newBuilder()
-        .setIssuerPublicKey(ByteString.copyFrom(issuerPubKey))
+        .setIssuerPublicKey(ByteString.copyFrom(signer.identityPublicKey))
         .setTokenName(tokenName)
         .setTokenTicker(tokenTicker)
         .setDecimals(decimals.toInt())
@@ -156,64 +185,50 @@ public suspend fun SparkWallet.createToken(
         }
         .build()
 
-    val tx = TokenTransaction.newBuilder()
-        .setVersion(2)
-        .setNetwork(config.network.toProto())
-        .setCreateInput(createInput)
-        .addAllSparkOperatorIdentityPublicKeys(collectOperatorIdentityPublicKeys())
-        .setClientCreatedTimestamp(currentTimestamp())
-        .build()
-
-    val (txHash, tokenId) = broadcastTokenTransactionV2Detailed(
-        tokenTransaction = tx,
-        signingPublicKeys = null,
-        revocationCommitments = null,
-    )
-
-    val bech32TokenId = tokenId?.let { encodeBech32mTokenIdentifier(it, config.network) }
-    return TokenCreationResult(transactionHash = txHash, tokenIdentifier = bech32TokenId)
+    val sent = sendTokenTransaction(createDraft(createInput))
+    val bech32TokenId = sent.tokenIdentifier?.let { encodeBech32mTokenIdentifier(it, config.network) }
+    return TokenCreationResult(transactionHash = sent.transactionHash, tokenIdentifier = bech32TokenId)
 }
 
+/**
+ * The operators' rules for a new token (`TokenMetadata.ValidatePartial`), also the reference
+ * SDK's: the name 3–20 and the ticker 3–6 UTF-8 bytes, both in Unicode normalization form C;
+ * decimals up to 255; extra metadata up to 1024 bytes. The operators refuse a token that breaks
+ * them with INTERNAL, which reaches the wallet as "Something went wrong.", so each rule is
+ * checked here to say which one.
+ */
+internal fun validateTokenParameters(tokenName: String, tokenTicker: String, decimals: UInt, extraMetadata: ByteArray?) {
+    fun refuse(message: String): Nothing = throw SparkError.TokenValidationFailed(message)
+    if (!Normalizer.isNormalized(tokenName, Normalizer.Form.NFC)) refuse("Token name must be NFC-normalized UTF-8")
+    if (!Normalizer.isNormalized(tokenTicker, Normalizer.Form.NFC)) refuse("Token ticker must be NFC-normalized UTF-8")
+    val nameBytes = tokenName.toByteArray(Charsets.UTF_8).size
+    if (nameBytes !in 3..20) refuse("Token name must be 3-20 UTF-8 bytes, not $nameBytes")
+    val tickerBytes = tokenTicker.toByteArray(Charsets.UTF_8).size
+    if (tickerBytes !in 3..6) refuse("Token ticker must be 3-6 UTF-8 bytes, not $tickerBytes")
+    if (decimals > 255u) refuse("Decimals must be <= 255")
+    if (extraMetadata != null && extraMetadata.size > 1024) refuse("Extra metadata must be <= 1024 bytes")
+}
+
+/**
+ * Mint additional tokens for an existing token. Caller must be the token issuer.
+ *
+ * @param idempotencyKey Sent with the transaction, so the operators answer a retry with the key
+ *   from their idempotency records rather than minting again.
+ */
 public suspend fun SparkWallet.mintTokens(tokenIdentifier: Bech32mTokenIdentifier, tokenAmount: BigInteger, idempotencyKey: String? = null,): String {
-    require(tokenAmount > BigInteger.ZERO) { "Mint amount must be greater than 0" }
+    if (tokenAmount.signum() <= 0) throw SparkError.TokenValidationFailed("Mint amount must be greater than 0")
 
     val (rawTokenId, _) = decodeBech32mTokenIdentifier(tokenIdentifier, config.network)
-    val issuerPubKey = signer.identityPublicKey
-
-    val mintInput = TokenMintInput.newBuilder()
-        .setIssuerPublicKey(ByteString.copyFrom(issuerPubKey))
-        .setTokenIdentifier(ByteString.copyFrom(rawTokenId))
-        .build()
-
-    val mintOutput = TokenOutput.newBuilder()
-        .setOwnerPublicKey(ByteString.copyFrom(issuerPubKey))
-        .setTokenIdentifier(ByteString.copyFrom(rawTokenId))
-        .setTokenAmount(ByteString.copyFrom(encodeUInt128(tokenAmount)))
-        .build()
-
-    val tx = TokenTransaction.newBuilder()
-        .setVersion(2)
-        .setNetwork(config.network.toProto())
-        .setMintInput(mintInput)
-        .addTokenOutputs(mintOutput)
-        .addAllSparkOperatorIdentityPublicKeys(collectOperatorIdentityPublicKeys())
-        .setClientCreatedTimestamp(currentTimestamp())
-        .build()
-
-    return broadcastTokenTransactionV2(
-        tokenTransaction = tx,
-        signingPublicKeys = null,
-        revocationCommitments = null,
-        idempotencyKey = idempotencyKey,
-    )
+    return sendTokenTransaction(mintDraft(rawTokenId, tokenAmount), idempotencyKey = idempotencyKey).transactionHash
 }
 
+/** Burn tokens by transferring them to a dead address. */
 public suspend fun SparkWallet.burnTokens(
     tokenIdentifier: Bech32mTokenIdentifier,
     tokenAmount: BigInteger,
     strategy: TokenOutputSelectionStrategy = TokenOutputSelectionStrategy.SMALL_FIRST,
 ): String {
-    val burnPubKey = ByteArray(33).apply { this[0] = 0x02 }
+    val burnPubKey = ByteArray(33).apply { fill(0x02) }
     val (rawTokenId, _) = decodeBech32mTokenIdentifier(tokenIdentifier, config.network)
 
     val outputs = fetchTokenOutputs(tokenIdentifiers = listOf(rawTokenId))
@@ -221,21 +236,14 @@ public suspend fun SparkWallet.burnTokens(
         throw SparkError.InsufficientTokenBalance(token = tokenIdentifier, need = "$tokenAmount", have = "0")
     }
 
-    val selected = selectTokenOutputs(outputs, tokenAmount, strategy)
+    val selected = tokenOutputLocks.acquire(outputs) { selectTokenOutputs(it, tokenAmount, strategy) }
 
-    val tx = buildTransferTokenTransaction(
-        selectedOutputs = selected,
-        receiverOutputs = listOf(Triple(burnPubKey, rawTokenId, tokenAmount)),
-        changeOwnerPubKey = signer.identityPublicKey,
+    val burn = TokenOutputSpec(owner = ByteString.copyFrom(burnPubKey), tokenIdentifier = ByteString.copyFrom(rawTokenId), amount = tokenAmount)
+    val draft = transferDraft(
+        spent = selected,
+        outputs = transferOutputs(spent = selected, receivers = listOf(burn), changeOwner = ByteString.copyFrom(signer.identityPublicKey)),
     )
-
-    return broadcastTokenTransactionV2(
-        tokenTransaction = tx,
-        signingPublicKeys = selected.map { it.output.ownerPublicKey.toByteArray() },
-        revocationCommitments = selected.mapNotNull {
-            if (it.output.hasRevocationCommitment()) it.output.revocationCommitment.toByteArray() else null
-        },
-    )
+    return sendTokenTransaction(draft, spentOutputs = selected).transactionHash
 }
 
 // MARK: - Token Output Selection
@@ -245,7 +253,7 @@ internal fun selectTokenOutputs(
     amount: BigInteger,
     strategy: TokenOutputSelectionStrategy,
 ): List<OutputWithPreviousTransactionData> {
-    require(amount > BigInteger.ZERO) { "Token amount must be greater than 0" }
+    if (amount.signum() <= 0) throw SparkError.TokenValidationFailed("Token amount must be greater than 0")
 
     val totalAvailable = outputs.fold(BigInteger.ZERO) { acc, o -> acc + decodeUInt128(o.output.tokenAmount) }
     if (totalAvailable < amount) {
@@ -304,103 +312,14 @@ internal fun selectTokenOutputs(
     }
 }
 
-// MARK: - Internal: Build V2 Transfer Transaction
-
-private fun SparkWallet.buildTransferTokenTransaction(
-    selectedOutputs: List<OutputWithPreviousTransactionData>,
-    receiverOutputs: List<Triple<ByteArray, ByteArray, BigInteger>>, // (receiverPubKey, rawTokenIdentifier, tokenAmount)
-    changeOwnerPubKey: ByteArray,
-): TokenTransaction {
-    val sorted = selectedOutputs.sortedBy { it.previousTransactionVout }
-
-    val availableByToken = mutableMapOf<ByteString, BigInteger>()
-    for (output in sorted) {
-        val key = output.output.tokenIdentifier
-        availableByToken[key] = (availableByToken[key] ?: BigInteger.ZERO) + decodeUInt128(output.output.tokenAmount)
-    }
-
-    val requestedByToken = mutableMapOf<ByteString, BigInteger>()
-    for ((_, rawTokenId, amount) in receiverOutputs) {
-        val key = ByteString.copyFrom(rawTokenId)
-        requestedByToken[key] = (requestedByToken[key] ?: BigInteger.ZERO) + amount
-    }
-
-    val tokenOutputs = mutableListOf<TokenOutput>()
-
-    // Receiver outputs
-    for ((receiverPubKey, rawTokenId, amount) in receiverOutputs) {
-        tokenOutputs.add(
-            TokenOutput.newBuilder()
-                .setOwnerPublicKey(ByteString.copyFrom(receiverPubKey))
-                .setTokenIdentifier(ByteString.copyFrom(rawTokenId))
-                .setTokenAmount(ByteString.copyFrom(encodeUInt128(amount)))
-                .build()
-        )
-    }
-
-    // Change outputs
-    for ((tokenId, availableAmount) in availableByToken) {
-        val requestedAmount = requestedByToken[tokenId] ?: BigInteger.ZERO
-        if (availableAmount > requestedAmount) {
-            tokenOutputs.add(
-                TokenOutput.newBuilder()
-                    .setOwnerPublicKey(ByteString.copyFrom(changeOwnerPubKey))
-                    .setTokenIdentifier(tokenId)
-                    .setTokenAmount(ByteString.copyFrom(encodeUInt128(availableAmount - requestedAmount)))
-                    .build()
-            )
-        }
-    }
-
-    val transferInput = TokenTransferInput.newBuilder()
-        .addAllOutputsToSpend(
-            sorted.map { output ->
-                TokenOutputToSpend.newBuilder()
-                    .setPrevTokenTransactionHash(output.previousTransactionHash)
-                    .setPrevTokenTransactionVout(output.previousTransactionVout)
-                    .build()
-            }
-        )
-        .build()
-
-    return TokenTransaction.newBuilder()
-        .setVersion(2)
-        .setNetwork(config.network.toProto())
-        .setTransferInput(transferInput)
-        .addAllTokenOutputs(tokenOutputs)
-        .addAllSparkOperatorIdentityPublicKeys(collectOperatorIdentityPublicKeys())
-        .setClientCreatedTimestamp(currentTimestamp())
-        .build()
-}
-
 // MARK: - Internal: V2 Broadcast (Two-Phase: start + commit)
 
-private suspend fun SparkWallet.broadcastTokenTransactionV2(
+internal suspend fun SparkWallet.broadcastTokenTransactionV2(
     tokenTransaction: TokenTransaction,
     signingPublicKeys: List<ByteArray>?,
-    revocationCommitments: List<ByteArray>?,
     idempotencyKey: String? = null,
-): String {
-    val (txHash, _) = broadcastTokenTransactionV2Detailed(
-        tokenTransaction = tokenTransaction,
-        signingPublicKeys = signingPublicKeys,
-        revocationCommitments = revocationCommitments,
-        idempotencyKey = idempotencyKey,
-    )
-    return txHash
-}
-
-private suspend fun SparkWallet.broadcastTokenTransactionV2Detailed(
-    tokenTransaction: TokenTransaction,
-    signingPublicKeys: List<ByteArray>?,
-    revocationCommitments: List<ByteArray>?,
-    idempotencyKey: String? = null,
-): Pair<String, ByteArray?> {
-    val stub = if (idempotencyKey != null) {
-        getTokenStubWithIdempotency(idempotencyKey)
-    } else {
-        getTokenStub()
-    }
+): SentTokenTransaction {
+    val stub = getTokenStubWithIdempotency(idempotencyKey)
 
     // Phase 1: Hash partial transaction and sign
     val partialHash = hashTokenTransactionV2(tokenTransaction, partialHash = true)
@@ -448,11 +367,10 @@ private suspend fun SparkWallet.broadcastTokenTransactionV2Detailed(
         .build()
 
     // Use a fresh stub without idempotency for commit phase
-    val commitStub = getTokenStub()
-    val commitResponse = commitStub.commitTransaction(commitRequest)
+    val commitResponse = getTokenStub().commitTransaction(commitRequest)
 
     val tokenId = if (commitResponse.hasTokenIdentifier()) commitResponse.tokenIdentifier.toByteArray() else null
-    return finalHash.toHexString() to tokenId
+    return SentTokenTransaction(transactionHash = finalHash.toHexString(), tokenIdentifier = tokenId)
 }
 
 // MARK: - Internal: Signature Helpers
@@ -476,8 +394,8 @@ private fun SparkWallet.buildOwnerSignatures(tx: TokenTransaction, hash: ByteArr
             val keys = signingPublicKeys
                 ?: throw SparkError.TokenValidationFailed("Missing signing public keys for transfer")
             for ((i, key) in keys.withIndex()) {
-                require(key.contentEquals(signer.identityPublicKey)) {
-                    "Cannot sign with unknown key: ${key.toHexString()}"
+                if (!key.contentEquals(signer.identityPublicKey)) {
+                    throw SparkError.TokenValidationFailed("Cannot sign with unknown key: ${key.toHexString()}")
                 }
                 val sig = signer.signWithIdentityKey(hash)
                 signatures.add(
@@ -586,17 +504,26 @@ internal suspend fun SparkWallet.fetchTokenOutputs(tokenIdentifiers: List<ByteAr
 
 // MARK: - Internal: Fetch Token Metadata
 
+/** Token identifiers per metadata query: the operators' `MaxTokenMetadataFilterValues`. */
+internal const val TOKEN_METADATA_BATCH_SIZE = 500
+
+/**
+ * Metadata of [tokenIdentifiers], asked for at most [TOKEN_METADATA_BATCH_SIZE] at a time: the
+ * operators refuse larger filters, and anyone can send a wallet tokens of as many kinds as they
+ * like.
+ */
 internal suspend fun SparkWallet.fetchTokenMetadata(tokenIdentifiers: List<ByteArray>,): Map<ByteString, TokenMetadataInfo> {
     if (tokenIdentifiers.isEmpty()) return emptyMap()
 
     val stub = getTokenStub()
-    val request = QueryTokenMetadataRequest.newBuilder()
-        .addAllTokenIdentifiers(tokenIdentifiers.map { ByteString.copyFrom(it) })
-        .build()
+    val metadata = tokenIdentifiers.chunked(TOKEN_METADATA_BATCH_SIZE).flatMap { batch ->
+        val request = QueryTokenMetadataRequest.newBuilder()
+            .addAllTokenIdentifiers(batch.map { ByteString.copyFrom(it) })
+            .build()
+        stub.queryTokenMetadata(request).tokenMetadataList
+    }
 
-    val response = stub.queryTokenMetadata(request)
-
-    return response.tokenMetadataList.associate { meta ->
+    return metadata.associate { meta ->
         val bech32Id = encodeBech32mTokenIdentifier(meta.tokenIdentifier.toByteArray(), config.network)
         meta.tokenIdentifier to TokenMetadataInfo(
             tokenIdentifier = bech32Id,
@@ -618,7 +545,7 @@ internal suspend fun SparkWallet.fetchTokenMetadata(tokenIdentifiers: List<ByteA
  * Now on the operators' clock: they refuse a client timestamp outside the transaction's validity
  * window measured on theirs (the reference SDK stamps server time too).
  */
-private fun SparkWallet.currentTimestamp(): Timestamp {
+internal fun SparkWallet.currentTimestamp(): Timestamp {
     val now = serverClock.nowMillis()
     val seconds = now / 1000
     val nanos = ((now % 1000) * 1_000_000).toInt()

@@ -26,6 +26,22 @@ internal suspend fun expectSparkErrorSuspending(label: String = "", block: suspe
     return error ?: throw AssertionError("expected a SparkError${if (label.isEmpty()) "" else " ($label)"}")
 }
 
+/**
+ * Swift's `await #expect(throws: RPCError.self) { ... }`: [block] fails with an operator's gRPC
+ * status, which is returned.
+ */
+internal suspend fun expectGrpcFailure(label: String = "", block: suspend () -> Unit): io.grpc.Status {
+    val error = try {
+        block()
+        null
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        e
+    }
+    return error?.grpcStatus ?: throw AssertionError("expected a gRPC failure${if (label.isEmpty()) "" else " ($label)"}, got ${error ?: "success"}")
+}
+
 /** A P2TR output script whose 32-byte key is [byte] repeated. */
 internal fun p2trScript(byte: Int): ByteArray = byteArrayOf(0x51, 0x20) + bytes(byte, 32)
 

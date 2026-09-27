@@ -26,6 +26,21 @@ public enum class SparkNetwork {
         }
 }
 
+/** How token transactions are sent to the operators. */
+public enum class TokenTransactionVersion {
+    /**
+     * One `broadcast_transaction` call, signed over the protohash of the partial transaction:
+     * the reference SDK's default, and the format the operators are moving to.
+     */
+    V3,
+
+    /**
+     * `start_transaction` then `commit_transaction`, signed over the V2 hashes. Kept while the
+     * operators accept it, as the reference SDK keeps it.
+     */
+    V2,
+}
+
 /**
  * Address and identity of a single Spark signing operator.
  *
@@ -60,6 +75,8 @@ public data class SigningOperatorConfig(val address: String, val identifier: Str
  *   outputs (reference SDK: 10 000). A final token transaction with another value is refused.
  * @property expectedWithdrawRelativeBlockLocktime Relative block locktime the coordinator is
  *   expected to set on token outputs (reference SDK: 1 000).
+ * @property tokenTransactionVersion How token transactions are sent: V3 by default, as in the
+ *   reference SDK.
  */
 public data class SparkConfig(
     val network: SparkNetwork = SparkNetwork.MAINNET,
@@ -69,6 +86,7 @@ public data class SparkConfig(
     val signingThreshold: UInt = defaultThreshold(signingOperators.size),
     val expectedWithdrawBondSats: ULong = 10_000uL,
     val expectedWithdrawRelativeBlockLocktime: ULong = 1_000uL,
+    val tokenTransactionVersion: TokenTransactionVersion = TokenTransactionVersion.V3,
 ) {
     val signingOperatorAddresses: List<String>
         get() = signingOperators.map { it.address }

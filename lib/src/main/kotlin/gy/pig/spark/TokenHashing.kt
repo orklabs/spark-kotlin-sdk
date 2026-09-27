@@ -1,5 +1,7 @@
 package gy.pig.spark
 
+import com.google.protobuf.InvalidProtocolBufferException
+import spark.Spark
 import spark_token.TokenTransaction
 import spark_token.TokenTransactionType
 import java.nio.ByteBuffer
@@ -158,18 +160,48 @@ internal fun hashTokenTransactionV2(tx: TokenTransaction, partialHash: Boolean):
         allHashes.add(sha256(uint64BE(expirySecs)))
     }
 
-    // Hash invoice attachments (V2)
+    // Hash invoice attachments (V2): each raw invoice string, ordered by the invoice's id (its 16
+    // UUID bytes) as the operators and the reference SDK order them.
     val attachments = tx.invoiceAttachmentsList
     allHashes.add(sha256(uint32BE(attachments.size.toUInt())))
-    val sorted = attachments.sortedBy { it.sparkInvoice }
-    for (attachment in sorted) {
-        allHashes.add(sha256(attachment.sparkInvoice.toByteArray(Charsets.UTF_8)))
+    val keyed = attachments.mapIndexed { index, attachment -> sparkInvoiceId(attachment.sparkInvoice, index) to attachment.sparkInvoice }
+    for ((_, invoice) in keyed.sortedWith { a, b -> compareUnsigned(a.first, b.first) }) {
+        allHashes.add(sha256(invoice.toByteArray(Charsets.UTF_8)))
     }
 
     // Final hash of all concatenated hashes
     val concatenated = java.io.ByteArrayOutputStream()
     for (h in allHashes) concatenated.write(h)
     return sha256(concatenated.toByteArray())
+}
+
+/**
+ * The id of the Spark invoice in invoice attachment [index]: the 16 UUID bytes of its
+ * `SparkInvoiceFields.id`. On any network: the hash does not check it, as the operators' and the
+ * reference SDK's do not.
+ */
+private fun sparkInvoiceId(invoice: String, index: Int): ByteArray {
+    val fields = try {
+        val (_, words) = Bech32m.decodeBech32m(invoice)
+        Bech32.fromWords(words)?.let { Spark.SparkAddress.parseFrom(it) }?.takeIf { it.hasSparkInvoiceFields() }?.sparkInvoiceFields
+    } catch (_: SparkError) {
+        null
+    } catch (_: InvalidProtocolBufferException) {
+        null
+    }
+    if (fields == null || fields.id.size() != 16) {
+        throw SparkError.InvalidArgument("invoice attachment $index is not a Spark invoice with a 16-byte id")
+    }
+    return fields.id.toByteArray()
+}
+
+/** Lexicographic order of byte strings, bytes compared unsigned. */
+private fun compareUnsigned(a: ByteArray, b: ByteArray): Int {
+    for (i in 0 until minOf(a.size, b.size)) {
+        val cmp = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
+        if (cmp != 0) return cmp
+    }
+    return a.size - b.size
 }
 
 /**
