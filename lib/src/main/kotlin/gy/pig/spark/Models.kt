@@ -6,28 +6,26 @@ import java.util.Date
 /**
  * Breakdown of the wallet's sat balance.
  *
- * Mirrors `SparkSDK/Models.SatsBalance` from the official Swift SDK so the
- * Kotlin and Swift surfaces compose into the same numbers when the same
- * wallet is queried from both platforms.
+ * Mirrors `SparkSDK/Models.SatsBalance` from the Swift SDK so the Kotlin and Swift surfaces
+ * compose into the same numbers when the same wallet is queried from both platforms.
  *
- * - [available]: sats that can be sent right now — `AVAILABLE` leaves whose
- *   refund timelock is above the floor the coordinator enforces. Sending the
- *   full [available] balance always succeeds.
- * - [owned]: every sat the wallet owns: [available] plus [frozen] plus value
- *   locked in outgoing transfers/swaps (`TRANSFER_LOCKED`, `SPLIT_LOCKED`,
- *   `AGGREGATE_LOCK`, `RENEW_LOCKED`). Use this for "how much do I own right
- *   now" displays where in-flight sends should not appear to vanish.
- * - [incoming]: pending inbound transfers that have not been claimed yet,
- *   plus on-chain deposits whose nodes are still in `CREATING` state.
- *   Add to [available] to mirror what most wallet UIs label "balance"
- *   while a payment is in flight.
- * - [frozen]: sats in `AVAILABLE` leaves at the timelock floor. The
- *   coordinator will neither move nor renew them; only a unilateral on-chain
- *   exit can recover them.
- * - [locked]: sats held by an in-flight transfer, swap, renewal or exit.
+ * - [available]: sats the wallet can send — `AVAILABLE` leaves whose refund timelock is at least
+ *   100. Leaves at 100…199 are renewed by every spend path before they are selected (the
+ *   coordinator will not move them otherwise), as the reference SDK does.
+ * - [owned]: every sat the wallet owns: [available] + [frozen] + [locked]. Locked sats are held by
+ *   an in-flight operation that can still come back: an outgoing transfer, Lightning payment or
+ *   cooperative exit before the operators apply the sender's key tweak (a cooperative exit until
+ *   its transaction confirms), a swap the wallet started, and its counter-transfer until claimed.
+ *   Sent sats leave [owned] once the sender's key tweak is applied, even before the receiver
+ *   claims them.
+ * - [incoming]: pending inbound transfers not yet claimed.
+ * - [frozen]: sats in `AVAILABLE` leaves whose refund timelock is below 100
+ *   ([SparkLeaf.isFrozen]). The coordinator will neither move nor renew them; only a unilateral
+ *   on-chain exit can recover them. A leaf at exactly 100 is renewable and counts as available.
+ * - [locked]: sats held by an in-flight transfer, swap or exit the wallet still owns.
  */
 public data class SatsBalance(public val available: Long, public val owned: Long, public val incoming: Long, public val frozen: Long,) {
-    /** Sats locked by an in-flight transfer, swap, renewal or exit (`owned - available - frozen`). */
+    /** Sats held by an in-flight transfer, swap or exit the wallet still owns (see [owned]). */
     public val locked: Long get() = maxOf(0L, owned - available - frozen)
 }
 
@@ -55,6 +53,31 @@ public data class SparkTransfer(
     val createdAt: Date,
     val sparkInvoice: String? = null,
 )
+
+/** The transfer as an operator reported it. */
+internal fun spark.Spark.Transfer.toSparkTransfer(): SparkTransfer = SparkTransfer(
+    id = id,
+    senderIdentityPublicKey = senderIdentityPublicKey.toByteArray().toHexString(),
+    receiverIdentityPublicKey = receiverIdentityPublicKey.toByteArray().toHexString(),
+    totalValueSats = reportedSats(totalValue),
+    status = status.toString(),
+    type = type.toString(),
+    createdAt = Date(createdTime.seconds * 1000 + createdTime.nanos / 1_000_000),
+    sparkInvoice = sparkInvoice.takeIf { it.isNotEmpty() },
+)
+
+/** Every bitcoin there will ever be, in sats. */
+internal const val MAX_SUPPLY_SATS: Long = 21_000_000L * 100_000_000L
+
+/**
+ * A sats amount an operator reported in a protobuf `uint64`, which Kotlin reads as a signed
+ * `Long`: capped at the bitcoin supply, so 2^63 and above (negative here) or any hostile value
+ * cannot turn into a negative amount, and sums of such amounts stay far from overflowing.
+ */
+internal fun reportedSats(value: Long): Long = if (value < 0 || value > MAX_SUPPLY_SATS) MAX_SUPPLY_SATS else value
+
+/** A sats amount from a transaction output (the SSP or a block explorer), capped at the bitcoin supply. */
+internal fun reportedSats(value: ULong): Long = if (value > MAX_SUPPLY_SATS.toULong()) MAX_SUPPLY_SATS else value.toLong()
 
 public data class DepositAddress(val address: String, val leafId: String, val userPublicKey: ByteArray, val verifyingKey: ByteArray,) {
     override fun equals(other: Any?): Boolean {
@@ -87,8 +110,13 @@ public data class WithdrawAllQuote(
     public val spendableSats: Long,
     /** The SSP's fee quote (fast exit) for those leaves. Zero when there is nothing to send. */
     public val quotedFeeSats: Long,
-    /** Sats in leaves at the timelock floor. They stay behind; only a unilateral exit moves them. */
+    /** Sats in frozen leaves (refund timelock below 100). They stay behind; only a unilateral exit moves them. */
     public val frozenSats: Long,
+    /**
+     * Sats in leaves that need a renewal (refund timelock 100…199) the operators did not
+     * complete. They stay behind this time; a later attempt can renew and move them.
+     */
+    public val unrenewedSats: Long,
     /** Sats in leaves locked by an in-flight swap or exit. Withdraw again once they settle. */
     public val lockedSats: Long,
     /** Inbound sats that are still unclaimed after the claim attempt. */
@@ -118,8 +146,10 @@ public data class WithdrawAllResult(
     public val sentSats: Long,
     /** Sats the verified exit transaction pays to the destination. */
     public val payoutSats: Long,
-    /** Sats left in frozen leaves; only a unilateral exit can recover them. */
+    /** Sats left in frozen leaves (refund timelock below 100); only a unilateral exit can recover them. */
     public val frozenSats: Long,
+    /** Sats left in leaves whose renewal the operators did not complete; a later drain can move them. */
+    public val unrenewedSats: Long,
     /** Sats left in leaves locked by an in-flight operation. */
     public val lockedSats: Long,
     /** Inbound sats that could not be claimed before the drain. */

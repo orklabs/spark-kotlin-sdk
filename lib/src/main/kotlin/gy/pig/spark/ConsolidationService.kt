@@ -73,6 +73,9 @@ public suspend fun SparkWallet.consolidateLeaves(maxLeavesPerRound: Int = 100): 
         processSwapBatch(leaves = batch, targetAmounts = targets)
         rounds++
 
+        // Swap outputs can arrive in the renewal range; renew them so the next round can use them
+        // (best effort, as before the first round).
+        bestEffort { renewExhaustedLeaves() }
         val refreshed = getLeaves()
         progressing = refreshed.size < current.size // no progress — stop
         if (progressing) current = refreshed

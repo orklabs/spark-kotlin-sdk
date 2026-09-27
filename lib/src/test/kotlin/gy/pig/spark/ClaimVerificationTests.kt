@@ -167,4 +167,87 @@ class ClaimVerificationTests {
         assertTrue(TransferLeafVerifier.verifyECDSA(compact, digest, sender.identityPublicKey))
         assertFalse(TransferLeafVerifier.verifyECDSA(malleated, digest, sender.identityPublicKey))
     }
+
+    private fun edge(id: String, key: ByteArray, status: Spark.TransferReceiverStatus = Spark.TransferReceiverStatus.TRANSFER_RECEIVER_STATUS_KEY_TWEAKED) =
+        Spark.TransferReceiver.newBuilder().setId(id).setIdentityPublicKey(key.toByteString()).setStatus(status).build()
+
+    @Test
+    fun aMultiReceiverTransferIsClaimedForThisWalletsOwnLeavesWhicheverReceiverTheOperatorsRecorded() {
+        val other = byteArrayOf(0x03) + bytes(0x44, 32)
+        val mine = leaf("leaf-a", transferId, bytes(1, 40), signWith = sender).toBuilder().setTransferReceiverId("edge-me").build()
+        val theirs = leaf("leaf-b", transferId, bytes(2, 40), signWith = sender).toBuilder().setTransferReceiverId("edge-other").build()
+        // The operators record the lowest receiver key, which is not this wallet's.
+        val split = transfer(listOf(mine, theirs)).toBuilder()
+            .setReceiverIdentityPublicKey(other.toByteString())
+            .addReceivers(edge("edge-other", other))
+            .addReceivers(edge("edge-me", receiver.identityPublicKey))
+            .build()
+
+        val scoped = TransferLeafVerifier.scoped(split, receiver.identityPublicKey)
+        assertEquals(listOf("leaf-a"), scoped.leavesList.map { it.leaf.id })
+        TransferLeafVerifier.verify(scoped, receiver.identityPublicKey)
+
+        // Not among the receivers, or no leaves on this wallet's edge.
+        expectSparkError { TransferLeafVerifier.scoped(split, sender.identityPublicKey) }
+        val unassigned = split.toBuilder().clearLeaves().addLeaves(theirs).build()
+        expectSparkError { TransferLeafVerifier.scoped(unassigned, receiver.identityPublicKey) }
+        // A single-receiver transfer is not narrowed.
+        val single = transfer(listOf(mine))
+        assertEquals(single, TransferLeafVerifier.scoped(single, receiver.identityPublicKey))
+
+        // This wallet's leg completes with its own edge, before the whole transfer does.
+        assertFalse(TransferLeafVerifier.isReceiverLegComplete(split, receiver.identityPublicKey))
+        val legDone = split.toBuilder()
+            .clearReceivers()
+            .addReceivers(edge("edge-other", other))
+            .addReceivers(edge("edge-me", receiver.identityPublicKey, Spark.TransferReceiverStatus.TRANSFER_RECEIVER_STATUS_COMPLETED))
+            .build()
+        assertTrue(TransferLeafVerifier.isReceiverLegComplete(legDone, receiver.identityPublicKey))
+        assertFalse(TransferLeafVerifier.isReceiverLegComplete(legDone, other))
+        val whole = single.toBuilder().setStatus(Spark.TransferStatus.TRANSFER_STATUS_COMPLETED).build()
+        assertTrue(TransferLeafVerifier.isReceiverLegComplete(whole, receiver.identityPublicKey))
+        assertFalse(TransferLeafVerifier.isReceiverLegComplete(single, receiver.identityPublicKey))
+    }
+
+    @Test(timeout = 60_000)
+    fun aTransferIsLookedUpByIdWithTheOperatorsByIdQuery() = kotlinx.coroutines.runBlocking {
+        val state = FakeOperatorState { false }
+        val known = Spark.Transfer.newBuilder()
+            .setId("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+            .setTotalValue(42)
+            .setStatus(Spark.TransferStatus.TRANSFER_STATUS_COMPLETED)
+            .build()
+        state.know(known)
+        withFakeOperator(state) { wallet ->
+            val transfer = wallet.getTransfer(known.id.uppercase())
+            assertEquals(known.id, transfer.id)
+            assertEquals(42L, transfer.totalValueSats)
+            expectSparkErrorSuspending { wallet.getTransfer("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c") }
+        }
+        assertEquals(listOf("query_transfers_by_id", "query_transfers_by_id"), state.methods)
+    }
+
+    @Test(timeout = 60_000)
+    fun historyListsTheReferenceSdksTransferTypesALookupByIdsAsksForExactlyThose() = kotlinx.coroutines.runBlocking {
+        val state = FakeOperatorState { false }
+        withFakeOperator(state) { wallet ->
+            wallet.getTransfers(limit = 10)
+            wallet.getTransfers(ids = listOf("a", "b"))
+        }
+        val filters = state.transferFilters
+        assertEquals(2, filters.size)
+        assertEquals(
+            listOf(Spark.TransferType.COOPERATIVE_EXIT, Spark.TransferType.PREIMAGE_SWAP, Spark.TransferType.UTXO_SWAP, Spark.TransferType.TRANSFER),
+            filters.first().typesList,
+        )
+        assertTrue(filters.first().transferIdsList.isEmpty())
+        assertTrue(filters.last().typesList.isEmpty())
+        assertEquals(listOf("a", "b"), filters.last().transferIdsList)
+    }
+
+    @Test
+    fun anOperatorReportedAmountAbove2To63IsCappedNotNegative() {
+        val hostile = Spark.Transfer.newBuilder().setId("hostile").setTotalValue(-1L).build() // uint64 max
+        assertEquals(MAX_SUPPLY_SATS, hostile.toSparkTransfer().totalValueSats)
+    }
 }

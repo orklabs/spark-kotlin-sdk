@@ -59,7 +59,7 @@ class ConsolidationServiceTests {
     @Test
     fun computeNextSequencesThrowsAtOrBelowFloor() {
         val bit30 = 1u shl 30
-        for (timelock in listOf(100u, 50u, 0u)) {
+        for (timelock in listOf(199u, 150u, 101u, 100u, 50u, 0u)) {
             try {
                 computeNextSequences(rawTxWithSequence(bit30 or timelock))
                 throw AssertionError("Expected LeafTimelockExhausted at timelock $timelock")
@@ -73,7 +73,10 @@ class ConsolidationServiceTests {
     fun timelockCanDecrementMatchesFloorRule() {
         val bit30 = 1u shl 30
         assertTrue(timelockCanDecrement(rawTxWithSequence(bit30 or 2000u)))
-        assertTrue(timelockCanDecrement(rawTxWithSequence(bit30 or 101u)))
+        assertTrue(timelockCanDecrement(rawTxWithSequence(bit30 or 200u)))
+        // The floor applies to the rounded timelock: 101…199 round down to 100.
+        assertTrue(!timelockCanDecrement(rawTxWithSequence(bit30 or 199u)))
+        assertTrue(!timelockCanDecrement(rawTxWithSequence(bit30 or 101u)))
         assertTrue(!timelockCanDecrement(rawTxWithSequence(bit30 or 100u)))
         assertTrue(!timelockCanDecrement(rawTxWithSequence(bit30 or 0u)))
     }

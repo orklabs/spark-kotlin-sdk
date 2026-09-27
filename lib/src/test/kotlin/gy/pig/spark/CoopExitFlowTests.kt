@@ -13,17 +13,6 @@ import uniffi.spark_frost.computeMultiInputSighashUniffi
 
 // Ported from the Swift SDK's `CoopExitFlowTests.swift`.
 
-private fun p2trScript(byte: Int): ByteArray = byteArrayOf(0x51, 0x20) + bytes(byte, 32)
-
-/** A minimal node transaction (one input with the given timelock, one P2TR output). */
-private fun nodeTx(timelock: UInt, value: ULong = 10_000uL, tag: Int = 0x11): ByteArray = RawTransaction(
-    version = 2u,
-    inputs = listOf(RawTransaction.Input(previousTxid = bytes(tag, 32), previousIndex = 0u, sequence = (1u shl 30) or timelock)),
-    outputs = listOf(RawTransaction.Output(value = value, scriptPubKey = p2trScript(tag))),
-    locktime = 0u,
-    hasWitnessSerialization = false,
-).serialized(includeWitness = true)
-
 /**
  * Cooperative exit refund construction. The refunds come from the FROST library, so these
  * tests need it on the host (see [NativeFrost]).
@@ -129,31 +118,167 @@ class BalanceSummaryTests {
         .build()
 
     @Test
-    fun availableExcludesFloorTimelockLeavesWhichAreReportedAsFrozenLockedAddsToOwnedOnly() {
+    fun leavesBelowTheRenewalMinimumAreFrozenRenewableLeavesCountAsAvailableOtherStatusesAreIgnored() {
         val nodes = mapOf(
             "a" to treeNode("a", status = "AVAILABLE", value = 8192, refundTimelock = 1600u),
             "b" to treeNode("b", status = "AVAILABLE", value = 32, refundTimelock = 0u),
             "c" to treeNode("c", status = "AVAILABLE", value = 2, refundTimelock = 100u),
             "d" to treeNode("d", status = "TRANSFER_LOCKED", value = 500, refundTimelock = 2000u),
             "e" to treeNode("e", status = "CREATING", value = 700, refundTimelock = 2000u),
+            // A renewal split node: permanently SPLIT_LOCKED, still carrying the owner key.
             "f" to treeNode("f", status = "SPLIT_LOCKED", value = 9, refundTimelock = 2000u),
             "g" to treeNode("g", status = "AVAILABLE", value = 64, refundTimelock = 200u),
+            "h" to treeNode("h", status = "AVAILABLE", value = 16, refundTimelock = 150u),
+            "i" to treeNode("i", status = "AVAILABLE", value = 4, refundTimelock = 99u),
         )
-        val s = summarizeNodes(nodes)
-        assertEquals(8192L + 64, s.available)
-        assertEquals(32L + 2, s.frozen)
-        assertEquals(8192L + 32 + 2 + 500 + 9 + 64, s.owned)
-        assertEquals(700L, s.creating)
-        assertEquals(setOf("a", "b", "c", "g"), s.leaves.map { it.id }.toSet())
+        val summary = summarizeNodes(nodes)
+        // 100 and 150 are renewable (the coordinator renews refund timelocks from 100), so they
+        // are available; 0 and 99 are below the renewal minimum and frozen.
+        assertEquals(8192L + 2 + 64 + 16, summary.available)
+        assertEquals(32L + 4, summary.frozen)
+        assertEquals(setOf("a", "b", "c", "g", "h", "i"), summary.leaves.map { it.id }.toSet())
         val empty = summarizeNodes(emptyMap())
-        assertTrue(empty.available == 0L && empty.owned == 0L && empty.frozen == 0L && empty.creating == 0L && empty.leaves.isEmpty())
+        assertTrue(empty.available == 0L && empty.frozen == 0L && empty.leaves.isEmpty())
+    }
+
+    private fun transfer(id: String, leaves: List<Pair<String, Long>>): Spark.Transfer = Spark.Transfer.newBuilder()
+        .setId(id)
+        .addAllLeaves(
+            leaves.map { (leafId, value) ->
+                Spark.TransferLeaf.newBuilder().setLeaf(Spark.TreeNode.newBuilder().setId(leafId).setValue(value)).build()
+            }
+        )
+        .build()
+
+    @Test
+    fun inFlightSatsCountEachLeafOnceAndNeverALeafThatIsAlreadyAvailable() {
+        val transfers = listOf(
+            transfer("outgoing", listOf("l1" to 500L, "l2" to 20L)),
+            // A self-transfer, or a counter-swap leaf mid-claim, shows up in two queries.
+            transfer("counter", listOf("l2" to 20L, "l3" to 8L)),
+            transfer("claimed", listOf("available-leaf" to 64L)),
+        )
+        assertEquals(500L + 20 + 8, leafSats(transfers, excludedLeafIds = setOf("available-leaf")))
+        assertEquals(0L, leafSats(emptyList(), excludedLeafIds = emptySet()))
+        val withoutNode = Spark.Transfer.newBuilder().addLeaves(Spark.TransferLeaf.getDefaultInstance()).build()
+        assertEquals(0L, leafSats(listOf(withoutNode), excludedLeafIds = emptySet()))
+    }
+
+    @Test
+    fun amountsAnOperatorReportsAboveTheBitcoinSupplyAreCappedInsteadOfGoingNegative() {
+        assertEquals(0L, reportedSats(0L))
+        assertEquals(12_345L, reportedSats(12_345L))
+        assertEquals(MAX_SUPPLY_SATS, reportedSats(MAX_SUPPLY_SATS))
+        // uint64 2^63 and above read as negative Longs.
+        assertEquals(MAX_SUPPLY_SATS, reportedSats(Long.MIN_VALUE))
+        assertEquals(MAX_SUPPLY_SATS, reportedSats(-1L))
+        assertEquals(MAX_SUPPLY_SATS, reportedSats(Long.MAX_VALUE))
+        assertEquals(MAX_SUPPLY_SATS, reportedSats(ULong.MAX_VALUE))
+        assertEquals(7L, reportedSats(7uL))
+
+        val hostile = Spark.Transfer.newBuilder().setId("hostile").setTotalValue(-1L).build()
+        assertEquals(MAX_SUPPLY_SATS, hostile.toSparkTransfer().totalValueSats)
+
+        // Two such leaves still add up without overflowing.
+        val nodes = mapOf(
+            "x" to treeNode("x", status = "AVAILABLE", value = -1L, refundTimelock = 2000u),
+            "y" to treeNode("y", status = "AVAILABLE", value = -1L, refundTimelock = 50u),
+        )
+        val summary = summarizeNodes(nodes)
+        assertEquals(MAX_SUPPLY_SATS, summary.available)
+        assertEquals(MAX_SUPPLY_SATS, summary.frozen)
+        assertEquals(2 * MAX_SUPPLY_SATS, leafSats(listOf(transfer("t", listOf("l1" to -1L, "l2" to -1L))), excludedLeafIds = emptySet()))
+    }
+
+    @Test
+    fun incomingLeavesOutCounterTransfersOfTheWalletsOwnSwapsAndLeavesCountedElsewhere() {
+        val counterSwap = transfer("counter", listOf("c1" to 512L)).toBuilder().setType(Spark.TransferType.COUNTER_SWAP_V3).build()
+        val legacyCounterSwap = transfer("legacy-counter", listOf("c2" to 256L)).toBuilder().setType(Spark.TransferType.COUNTER_SWAP).build()
+        val payment = transfer("lightning", listOf("p1" to 1_000L, "p2" to 24L)).toBuilder().setType(Spark.TransferType.PREIMAGE_SWAP).build()
+        val selfTransfer = transfer("self", listOf("s1" to 7L)).toBuilder().setType(Spark.TransferType.TRANSFER).build()
+        val pending = listOf(counterSwap, legacyCounterSwap, payment, selfTransfer)
+        // The self-transfer's leaf is already counted as outgoing.
+        val me = byteArrayOf(0x02) + bytes(0x33, 32)
+        assertEquals(1_000L + 24, incomingSats(pending, excludedLeafIds = setOf("s1"), receiver = me))
+        assertEquals(1_000L + 24 + 7, incomingSats(pending, excludedLeafIds = emptySet(), receiver = me))
+
+        // A multi-receiver payment counts only this wallet's leaves.
+        val splitBuilder = transfer("split", listOf("m1" to 300L, "m2" to 200L, "m3" to 100L)).toBuilder().setType(Spark.TransferType.TRANSFER)
+        for ((id, key) in listOf("edge-me" to me, "edge-other" to (byteArrayOf(0x03) + bytes(0x44, 32)))) {
+            splitBuilder.addReceivers(Spark.TransferReceiver.newBuilder().setId(id).setIdentityPublicKey(key.toByteString()))
+        }
+        for ((index, edge) in listOf("edge-me", "edge-other", "edge-me").withIndex()) {
+            splitBuilder.setLeaves(index, splitBuilder.getLeaves(index).toBuilder().setTransferReceiverId(edge))
+        }
+        assertEquals(300L + 100, incomingSats(listOf(splitBuilder.build()), excludedLeafIds = emptySet(), receiver = me))
+    }
+
+    @Test
+    fun inFlightTransfersAreQueriedWithTheReferenceSdksTypesAndStatuses() {
+        // transfer.ts SENDER_PENDING_STATUSES: before the sender key tweak is applied.
+        assertEquals(
+            listOf(
+                Spark.TransferStatus.TRANSFER_STATUS_SENDER_INITIATED,
+                Spark.TransferStatus.TRANSFER_STATUS_SENDER_INITIATED_COORDINATOR,
+                Spark.TransferStatus.TRANSFER_STATUS_APPLYING_SENDER_KEY_TWEAK,
+                Spark.TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAK_PENDING,
+            ),
+            SENDER_PENDING_STATUSES,
+        )
+        // ACTIVE_COUNTER_SWAP_STATUSES: the whole counter-transfer lifecycle until completion.
+        assertEquals(
+            SENDER_PENDING_STATUSES + listOf(
+                Spark.TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAKED,
+                Spark.TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAK_LOCKED,
+                Spark.TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAK_APPLIED,
+                Spark.TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAKED,
+                Spark.TransferStatus.TRANSFER_STATUS_RECEIVER_REFUND_SIGNED,
+            ),
+            ACTIVE_COUNTER_SWAP_STATUSES,
+        )
+        assertFalse(Spark.TransferStatus.TRANSFER_STATUS_COMPLETED in ACTIVE_COUNTER_SWAP_STATUSES)
+        assertEquals(
+            listOf(Spark.TransferType.COOPERATIVE_EXIT, Spark.TransferType.UTXO_SWAP, Spark.TransferType.PREIMAGE_SWAP, Spark.TransferType.TRANSFER),
+            OUTGOING_TRANSFER_TYPES,
+        )
+        assertEquals(listOf(Spark.TransferType.PRIMARY_SWAP_V3, Spark.TransferType.SWAP), PRIMARY_SWAP_TYPES)
+        assertEquals(listOf(Spark.TransferType.COUNTER_SWAP_V3, Spark.TransferType.COUNTER_SWAP), COUNTER_SWAP_TYPES)
     }
 
     @Test
     fun lockedIsWhatOwnedHoldsBeyondAvailableAndFrozen() {
-        // SatsBalance.locked (0.2.1): sats held by an in-flight transfer, swap, renewal or exit.
         assertEquals(509L, SatsBalance(available = 8256, owned = 8799, incoming = 700, frozen = 34).locked)
         assertEquals(0L, SatsBalance(available = 10, owned = 10, incoming = 0, frozen = 0).locked)
         assertEquals(0L, SatsBalance(available = 10, owned = 5, incoming = 0, frozen = 0).locked)
+    }
+
+    @Test(timeout = 60_000)
+    fun theBalanceReadsAvailableNodesAndInFlightAndPendingTransfersAndSurvivesUnreadableTokens() = kotlinx.coroutines.runBlocking {
+        val state = FakeOperatorState { false }
+        state.setNodes(
+            listOf(
+                treeNode("a", status = "AVAILABLE", value = 64, refundTimelock = 2000u),
+                treeNode("b", status = "AVAILABLE", value = 4, refundTimelock = 50u),
+            ),
+        )
+        state.failsTokenMetadata = true
+        state.setTokenOutputs(
+            listOf(
+                spark_token.OutputWithPreviousTransactionData.newBuilder()
+                    .setOutput(spark_token.TokenOutput.newBuilder().setTokenIdentifier(bytes(1, 32).toByteString()).setTokenAmount(bytes(0, 16).toByteString()))
+                    .build()
+            )
+        )
+        val balance = withFakeOperator(state) { it.getBalance() }
+        assertEquals(64L, balance.satsBalance.available)
+        assertEquals(4L, balance.satsBalance.frozen)
+        assertEquals(68L, balance.satsBalance.owned)
+        assertEquals(0L, balance.satsBalance.incoming)
+        assertTrue(balance.tokenBalances.isEmpty())
+        // Three in-flight queries (outgoing, primary swaps, counter swaps), sender-only for the first two.
+        val filters = state.transferFilters
+        assertEquals(3, filters.size)
+        assertEquals(2, filters.count { it.hasSenderIdentityPublicKey() })
+        assertEquals(1, filters.count { it.hasSenderOrReceiverIdentityPublicKey() })
     }
 }

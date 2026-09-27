@@ -5,6 +5,7 @@ import io.grpc.stub.MetadataUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.sync.Mutex
 import okhttp3.OkHttpClient
 import spark.SparkServiceGrpcKt
 import spark_token.SparkTokenServiceGrpcKt
@@ -56,6 +57,12 @@ public class SparkWallet private constructor(public val config: SparkConfig, pub
     private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     internal val authenticator = SparkAuthenticator(serverClock, transportScope)
+
+    /**
+     * Serialises transfer claims (see [claimPendingTransfers]): the reference SDK's
+     * `claimTransferMutex`. kotlinx's [Mutex] is fair, so claims run in arrival order.
+     */
+    internal val claimLock = Mutex()
 
     // Every operator channel re-issues a call the operator rejects as UNAUTHENTICATED with a fresh
     // token (the official SDK's auth middleware), dropping the rejected token only if it is still

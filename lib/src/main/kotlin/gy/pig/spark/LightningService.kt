@@ -478,13 +478,7 @@ private fun SparkWallet.buildHtlcSigningJobs(
         val directComm = htlcCommitments[i + selectedLeaves.size].signingNonceCommitmentsMap
         val directFromCpfpComm = htlcCommitments[i + 2 * selectedLeaves.size].signingNonceCommitmentsMap
 
-        val (cpfpSeq, _) = computeNextSequences(node.refundTx.toByteArray())
-        val bit30 = cpfpSeq and (1u shl 30)
-        val nextTimelock = cpfpSeq and 0xFFFFu
-
-        // HTLC sequences (matching JS SDK getNextHTLCTransactionSequence)
-        val htlcNextSequence = bit30 or (nextTimelock + HTLC_TIMELOCK_OFFSET)
-        val htlcDirectSequence = bit30 or (nextTimelock + DIRECT_HTLC_TIMELOCK_OFFSET)
+        val (htlcNextSequence, htlcDirectSequence) = htlcSequences(node.refundTx.toByteArray())
 
         // CPFP HTLC refund (no fee applied)
         val cpfpHtlc = constructHtlcTransaction(
@@ -546,6 +540,27 @@ private fun SparkWallet.buildHtlcSigningJobs(
         )
     }
     return HtlcSigningJobs(cpfp = htlcCpfpJobs, direct = htlcDirectJobs, directFromCpfp = htlcDirectFromCpfpJobs)
+}
+
+/**
+ * Sequences of a Lightning send's HTLC refunds: the current refund timelock minus 100, plus 70
+ * for the CPFP HTLC and 85 for the direct ones — the reference SDK's
+ * `getNextHTLCTransactionSequence`, and what the operators rebuild (refund sequence − 30 and − 15,
+ * `lightning_handler.go`). Unlike transfer refunds these are NOT rounded down to the interval.
+ * Spend paths only select leaves [isSpendable] allows, which keeps a leaf the operators would
+ * refuse to let the receiver claim (rounded timelock at the floor) out.
+ */
+internal fun htlcSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
+    val rawSequence = parseSequenceFromRawTx(refundTxData)
+    val currentTimelock = rawSequence and 0xFFFFu
+    if (currentTimelock <= SPARK_TIME_LOCK_INTERVAL.toUInt()) {
+        throw SparkError.LeafTimelockExhausted(
+            "Leaf timelock exhausted ($currentTimelock <= $SPARK_TIME_LOCK_INTERVAL); needs renewal before it can pay",
+        )
+    }
+    val nextTimelock = currentTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt()
+    val bit30 = rawSequence and (1u shl 30)
+    return (bit30 or (nextTimelock + HTLC_TIMELOCK_OFFSET)) to (bit30 or (nextTimelock + DIRECT_HTLC_TIMELOCK_OFFSET))
 }
 
 /** Fee estimate in sats (rounded up) for an outbound lightning payment. */

@@ -178,7 +178,7 @@ public suspend fun SparkWallet.claimStaticDepositWithMaxFee(transactionId: Strin
 
     val rawTx = fetchRawTransaction(transactionId)
     val output = parseTxOutput(rawTx, outputIndex)
-    val totalAmount = output.value.toLong()
+    val totalAmount = reportedSats(output.value)
     val fee = totalAmount - quote.creditAmountSats
 
     if (fee > maxFee) return null
@@ -321,7 +321,7 @@ public suspend fun SparkWallet.refundStaticDeposit(
     // Fetch deposit tx to know the output value
     val rawDepositTx = fetchRawTransaction(depositTransactionId)
     val depositOutput = parseTxOutput(rawDepositTx, outputIndex)
-    val creditAmountSats = depositOutput.value.toLong() - fee
+    val creditAmountSats = reportedSats(depositOutput.value) - fee
     require(creditAmountSats > 0) { "Fee too large, credit amount must be > 0" }
 
     // Build spend tx

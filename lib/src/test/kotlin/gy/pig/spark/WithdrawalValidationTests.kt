@@ -208,8 +208,18 @@ class SpendableLeafTests {
     fun sparkLeafIsSpendableAndIsRenewableFollowTheCoordinatorsFloorAndRenewalRange() {
         assertFalse(leaf("a", sats = 1, timelock = 0u).isSpendable)
         assertFalse(leaf("b", sats = 1, timelock = 100u).isSpendable)
-        assertTrue(leaf("c", sats = 1, timelock = 101u).isSpendable)
+        // The floor applies to the timelock rounded down to the interval: 101…199 count as 100.
+        assertFalse(leaf("c", sats = 1, timelock = 101u).isSpendable)
+        assertFalse(leaf("c", sats = 1, timelock = 199u).isSpendable)
+        assertTrue(leaf("c", sats = 1, timelock = 200u).isSpendable)
+        assertTrue(leaf("c", sats = 1, timelock = 740u).isSpendable)
         assertTrue(leaf("d", sats = 1, timelock = 2000u).isSpendable)
+        // Frozen means below the renewal minimum; a leaf at exactly 100 is renewable.
+        assertTrue(leaf("a", sats = 1, timelock = 0u).isFrozen)
+        assertTrue(leaf("a", sats = 1, timelock = 99u).isFrozen)
+        assertFalse(leaf("b", sats = 1, timelock = 100u).isFrozen)
+        assertFalse(leaf("c", sats = 1, timelock = 150u).isFrozen)
+        assertFalse(leaf("d", sats = 1, timelock = 2000u).isFrozen)
         assertFalse(leaf("a", sats = 1, timelock = 99u).isRenewable)
         assertTrue(leaf("b", sats = 1, timelock = 100u).isRenewable)
         assertTrue(leaf("c", sats = 1, timelock = 199u).isRenewable)
@@ -217,14 +227,20 @@ class SpendableLeafTests {
         val garbage = SparkLeaf(id = "garbage", treeID = "t", valueSats = 5, status = "AVAILABLE", node = Spark.TreeNode.newBuilder().setId("garbage").build())
         assertFalse(garbage.isSpendable)
         assertFalse(garbage.isRenewable)
+        assertTrue(garbage.isFrozen)
         // A leaf without node data (never produced by the SDK) is neither, rather than a crash.
         assertFalse(SparkLeaf(id = "bare", treeID = "t", valueSats = 5, status = "AVAILABLE").isSpendable)
         // The public flag and the internal selection filter agree.
-        val leaves = listOf(leaf("x", sats = 1, timelock = 0u), leaf("y", sats = 1, timelock = 100u), leaf("z", sats = 1, timelock = 150u))
+        val leaves = listOf(
+            leaf("x", sats = 1, timelock = 0u),
+            leaf("y", sats = 1, timelock = 100u),
+            leaf("z", sats = 1, timelock = 150u),
+            leaf("w", sats = 1, timelock = 250u),
+        )
         val viaFlag = leaves.filter { it.isSpendable }.map { it.id }
         val viaFilter = movableLeaves(leaves).map { it.id }
         assertEquals(viaFlag, viaFilter)
-        assertEquals(listOf("z"), viaFlag)
+        assertEquals(listOf("w"), viaFlag)
     }
 
     @Test
@@ -247,28 +263,31 @@ class SpendableLeafTests {
 class WithdrawAllTypesTests {
     @Test
     fun quoteDerivesPayoutFrozenShareAndFeeCoverage() {
-        val q = WithdrawAllQuote(spendableSats = 9_700, quotedFeeSats = 1_950, frozenSats = 300, lockedSats = 0, incomingSats = 0, leafCount = 4)
+        val q =
+            WithdrawAllQuote(spendableSats = 9_700, quotedFeeSats = 1_950, frozenSats = 300, unrenewedSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 4)
         assertEquals(7_750L, q.estimatedPayoutSats)
         assertTrue(abs(q.frozenFraction - 0.03) < 1e-9)
         assertTrue(q.coversFee)
 
-        val tiny = WithdrawAllQuote(spendableSats = 1_000, quotedFeeSats = 1_950, frozenSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 1)
+        val tiny =
+            WithdrawAllQuote(spendableSats = 1_000, quotedFeeSats = 1_950, frozenSats = 0, unrenewedSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 1)
         assertFalse(tiny.coversFee)
         assertTrue(tiny.estimatedPayoutSats < 0)
         assertEquals(0.0, tiny.frozenFraction, 0.0)
 
-        val onlyFrozen = WithdrawAllQuote(spendableSats = 0, quotedFeeSats = 0, frozenSats = 66, lockedSats = 0, incomingSats = 0, leafCount = 0)
+        val onlyFrozen =
+            WithdrawAllQuote(spendableSats = 0, quotedFeeSats = 0, frozenSats = 66, unrenewedSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 0)
         assertEquals(1.0, onlyFrozen.frozenFraction, 0.0)
         assertFalse(onlyFrozen.coversFee)
 
-        val empty = WithdrawAllQuote(spendableSats = 0, quotedFeeSats = 0, frozenSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 0)
+        val empty = WithdrawAllQuote(spendableSats = 0, quotedFeeSats = 0, frozenSats = 0, unrenewedSats = 0, lockedSats = 0, incomingSats = 0, leafCount = 0)
         assertEquals(0.0, empty.frozenFraction, 0.0)
         assertFalse(empty.coversFee)
     }
 
     @Test
     fun resultReportsTheFeeTheSspActuallyTook() {
-        val r = WithdrawAllResult(txid = "ab", sentSats = 5_000, payoutSats = 3_290, frozenSats = 66, lockedSats = 0, unclaimedSats = 0)
+        val r = WithdrawAllResult(txid = "ab", sentSats = 5_000, payoutSats = 3_290, frozenSats = 66, unrenewedSats = 0, lockedSats = 0, unclaimedSats = 0)
         assertEquals(1_710L, r.feeSats)
     }
 }

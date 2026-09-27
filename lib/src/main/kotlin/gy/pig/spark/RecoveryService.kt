@@ -139,7 +139,7 @@ internal fun buildRecoverySnapshot(all: Map<String, Spark.TreeNode>, identityPub
             SparkRecoveryLeaf(
                 id = id,
                 status = node.status,
-                valueSats = node.value,
+                valueSats = reportedSats(node.value),
                 treeNodeHex = node.toByteArray().toHexString(),
             )
         )

@@ -5,7 +5,6 @@ import com.google.protobuf.Empty
 import com.google.protobuf.Timestamp
 import spark.Spark
 import uniffi.spark_frost.*
-import java.util.Date
 import java.util.UUID
 
 /**
@@ -13,7 +12,9 @@ import java.util.UUID
  * (`spark1...` on mainnet, `sparkrt1...` on regtest). The address must be for the wallet's
  * network.
  *
- * @throws SparkError.InvalidAddress for a malformed address or one for another network.
+ * @throws SparkError.InvalidAddress for a malformed address, one for another network, or a
+ *   Spark invoice: sending to it as an address would ignore its amount, expiry and sender, and
+ *   the payee would not see it paid.
  */
 public suspend fun SparkWallet.send(receiverSparkAddress: String, amountSats: Long): SparkTransfer {
     val receiver = SparkAddress.decode(receiverSparkAddress, config.network)
@@ -39,7 +40,11 @@ internal fun validateSendArguments(receiverIdentityPublicKey: ByteArray, amountS
 public suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amountSats: Long,): SparkTransfer {
     validateSendArguments(receiverIdentityPublicKey, amountSats)
     val selectedLeaves = selectLeavesWithSwap(amountSats)
+    return transferLeaves(selectedLeaves, receiverIdentityPublicKey)
+}
 
+/** Transfer exactly [selectedLeaves] to the receiver in one Spark transfer. */
+internal suspend fun SparkWallet.transferLeaves(selectedLeaves: List<SparkLeaf>, receiverIdentityPublicKey: ByteArray): SparkTransfer {
     val stub = getCoordinatorStub()
     val networkStr = config.network.networkString
 
@@ -79,18 +84,12 @@ public suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amount
 
         val (cpfpSequence, directSequence) = computeNextSequences(node.refundTx.toByteArray())
 
-        val cpfpNodeTx = node.nodeTx.toByteArray()
-        val directNodeTx = if (node.directTx.isEmpty) null else node.directTx.toByteArray()
-
-        val refundTrio = constructRefundTxTrio(
-            cpfpNodeTx = cpfpNodeTx,
-            directNodeTx = directNodeTx,
-            vout = 0u,
+        val refundTrio = leafRefundTrio(
+            node = node,
             receivingPubkey = receiverIdentityPublicKey,
             network = networkStr,
             sequence = cpfpSequence,
             directSequence = directSequence,
-            feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
         )
 
         cpfpRefundJobs.add(
@@ -158,41 +157,79 @@ public suspend fun SparkWallet.send(receiverIdentityPublicKey: ByteArray, amount
         .build()
 
     val response = stub.startTransferV2(transferRequest)
-    val transfer = response.transfer
-    return SparkTransfer(
-        id = transfer.id,
-        senderIdentityPublicKey = transfer.senderIdentityPublicKey.toByteArray().toHexString(),
-        receiverIdentityPublicKey = transfer.receiverIdentityPublicKey.toByteArray().toHexString(),
-        totalValueSats = transfer.totalValue,
-        status = transfer.status.toString(),
-        type = transfer.type.toString(),
-        createdAt = Date(transfer.createdTime.seconds * 1000),
-        sparkInvoice = transfer.sparkInvoice.takeIf { it.isNotEmpty() },
-    )
+    return response.transfer.toSparkTransfer()
 }
 
-/** Compute next cpfp and direct sequences from a refund tx. */
+/**
+ * A leaf's refund transactions paying [receivingPubkey] at the given sequences: the CPFP refund,
+ * the direct-from-CPFP refund, and a direct refund when [directNodeTxForRefund] allows one.
+ */
+internal fun leafRefundTrio(node: Spark.TreeNode, receivingPubkey: ByteArray, network: String, sequence: UInt, directSequence: UInt,): RefundTxTrioResult =
+    constructRefundTxTrio(
+        cpfpNodeTx = node.nodeTx.toByteArray(),
+        directNodeTx = directNodeTxForRefund(node),
+        vout = 0u,
+        receivingPubkey = receivingPubkey,
+        network = network,
+        sequence = sequence,
+        directSequence = directSequence,
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+
+/**
+ * The direct node transaction a leaf's direct refund spends, or `null` when the leaf has none or
+ * is a zero-timelock node. The operators reject a direct refund for a zero node ("zero nodes must
+ * not have a direct refund tx"), and zero-timelock renewal leaves exactly that shape: a
+ * timelock-0 node transaction together with a direct one. Mirrors the reference SDK's
+ * `isZeroNode` check in its refund builders. (Lightning HTLC refunds follow a different rule:
+ * the operators expect a direct HTLC refund whenever a direct node transaction exists.)
+ */
+internal fun directNodeTxForRefund(node: Spark.TreeNode): ByteArray? {
+    if (node.directTx.isEmpty || isZeroTimelockNode(node.nodeTx.toByteArray())) return null
+    return node.directTx.toByteArray()
+}
+
+/**
+ * A refund timelock rounded down to the 100-block interval. The operators validate every
+ * successor refund against the rounded value (`RoundDownToTimelockInterval`), so a leaf whose
+ * timelock is not a multiple of 100 — 740, left by older SDKs — counts as 700.
+ */
+internal fun roundedTimelock(timelock: UInt): UInt = timelock - timelock % SPARK_TIME_LOCK_INTERVAL.toUInt()
+
+/**
+ * Whether a leaf with this refund timelock can be transferred, swapped or exited without a
+ * renewal first. The operators require the rounded timelock to stay above 100 so the next refund
+ * does not reach zero (`ValidateRenewalTimelockFloor`): a refund timelock of at least 200. Leaves
+ * at 100…199 need renewing; below 100 they cannot be renewed either.
+ */
+internal fun isTransferableRefundTimelock(timelock: UInt): Boolean = roundedTimelock(timelock) > SPARK_TIME_LOCK_INTERVAL.toUInt()
+
+/**
+ * The next CPFP and direct refund sequences for a transfer, swap or cooperative exit: the current
+ * refund timelock rounded down to the interval, minus 100, and the direct refunds 50 above that —
+ * exactly what the operators expect (`ValidateSequence`), and what the reference SDK builds
+ * (`createDecrementedTimelockRefundTxs` with `enforceTimelocks`). A raw decrement produced 640
+ * for a leaf at 740 where the operators require 600. Bit 30 is kept. Lightning HTLC refunds use
+ * [htlcSequences] instead: they are not rounded.
+ */
 internal fun computeNextSequences(refundTxData: ByteArray): Pair<UInt, UInt> {
     val rawSequence = parseSequenceFromRawTx(refundTxData)
     val currentTimelock = rawSequence and 0xFFFFu
     val bit30 = rawSequence and (1u shl 30)
-    // A leaf at the timelock floor cannot be moved again until it is renewed by the
-    // operators, and UInt subtraction would silently wrap to a garbage sequence instead of
-    // failing. Strictly greater: the coordinator rejects a decrement that reaches zero
-    // ("too small to subtract TimeLockInterval without reaching zero").
-    if (currentTimelock <= SPARK_TIME_LOCK_INTERVAL.toUInt()) {
+    // Checked before subtracting: UInt subtraction would silently wrap to a garbage sequence.
+    if (!isTransferableRefundTimelock(currentTimelock)) {
         throw SparkError.LeafTimelockExhausted(
-            "Leaf timelock exhausted ($currentTimelock <= $SPARK_TIME_LOCK_INTERVAL); needs renewal before it can move"
+            "Leaf timelock exhausted ($currentTimelock, rounded ${roundedTimelock(currentTimelock)} <= " +
+                "$SPARK_TIME_LOCK_INTERVAL); needs renewal before it can move",
         )
     }
-    val nextTimelock = currentTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt()
+    val nextTimelock = roundedTimelock(currentTimelock) - SPARK_TIME_LOCK_INTERVAL.toUInt()
     return (bit30 or nextTimelock) to (bit30 or (nextTimelock + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt()))
 }
 
 /**
- * Whether the leaf's refund timelock still has room to decrement — i.e. the leaf can be
- * transferred/swapped without operator renewal. Strictly greater: the coordinator rejects
- * decrements that reach zero.
+ * Whether the leaf can be transferred, swapped or exited without an operator renewal
+ * ([isTransferableRefundTimelock] on its refund transaction).
  */
 internal fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
     // An unparseable refund tx is treated as exhausted: the leaf is skipped rather than
@@ -202,7 +239,7 @@ internal fun timelockCanDecrement(refundTxData: ByteArray): Boolean {
     } catch (_: SparkError) {
         return false
     }
-    return (sequence and 0xFFFFu) > SPARK_TIME_LOCK_INTERVAL.toUInt()
+    return isTransferableRefundTimelock(sequence and 0xFFFFu)
 }
 
 /**

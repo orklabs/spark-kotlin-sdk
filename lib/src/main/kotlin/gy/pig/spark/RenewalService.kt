@@ -2,9 +2,12 @@ package gy.pig.spark
 
 import kotlinx.coroutines.CancellationException
 import spark.Spark
+import uniffi.spark_frost.NodeTxPairResult
+import uniffi.spark_frost.RefundTxTrioResult
 import uniffi.spark_frost.constructNodeTxPair
 import uniffi.spark_frost.constructRefundTxTrio
 import uniffi.spark_frost.getPublicKeyBytes
+import uniffi.spark_frost.getTaprootPubkey
 
 /**
  * Leaf timelock renewal — direct port of the Swift SDK's `RenewalService.swift`.
@@ -26,8 +29,8 @@ private const val RENEWAL_INITIAL_SEQUENCE: UInt = 2000u
 internal const val RENEWAL_THRESHOLD: UInt = 200u
 
 /**
- * Remaining refund-tx timelock in blocks. Below 200 the leaf should be renewed; at or
- * below 100 it cannot move; below 100 the coordinator will not renew it either (frozen).
+ * Remaining refund-tx timelock in blocks. Below 200 the leaf must be renewed before it can move;
+ * below 100 the coordinator will not renew it either (frozen).
  */
 public val SparkLeaf.refundTimelockBlocks: UInt
     get() {
@@ -42,12 +45,13 @@ public val SparkLeaf.refundTimelockBlocks: UInt
     }
 
 /**
- * Whether the leaf can be transferred, paid or exited right now: its refund timelock is
- * above the floor the coordinator enforces. Leaves in the renewable range just above the
- * floor are still spendable; [getSpendableLeaves] renews them first.
+ * Whether the leaf can be transferred, paid or exited right now without a renewal: its refund
+ * timelock, rounded down to the 100-block interval, is above the floor the coordinator enforces —
+ * at least 200. Leaves at 100…199 are renewable ([isRenewable]); [getSpendableLeaves] renews them
+ * first.
  */
 public val SparkLeaf.isSpendable: Boolean
-    get() = refundTimelockBlocks > SPARK_TIME_LOCK_INTERVAL.toUInt()
+    get() = isTransferableRefundTimelock(refundTimelockBlocks)
 
 /**
  * Whether the coordinator will renew this leaf's timelocks (refund timelock in [100, 200)).
@@ -58,6 +62,15 @@ public val SparkLeaf.isRenewable: Boolean
         val timelock = refundTimelockBlocks
         return timelock >= SPARK_TIME_LOCK_INTERVAL.toUInt() && timelock < RENEWAL_THRESHOLD
     }
+
+/**
+ * Whether the leaf is frozen: its refund timelock is below 100, the minimum the coordinator
+ * renews, and it is too low to move, so only a unilateral on-chain exit can recover it. A leaf at
+ * exactly 100 is renewable, not frozen. Leaves only get here through SDKs that decremented
+ * timelocks without renewing.
+ */
+public val SparkLeaf.isFrozen: Boolean
+    get() = refundTimelockBlocks < SPARK_TIME_LOCK_INTERVAL.toUInt()
 
 /**
  * Outcome of a renewal sweep. Renewals are per-leaf and best-effort: one failing leaf
@@ -73,14 +86,20 @@ public data class SparkLeafRenewal(
 /**
  * Renew every leaf whose refund timelock has run low (< 200 blocks).
  *
- * Three protocol variants, chosen per leaf like the TS SDK does:
- * - node timelock == 0 → renew_node_zero_timelock (L1-deposit roots)
+ * Three protocol variants, chosen per leaf like the TS SDK does ([renewalVariant]):
+ * - node timelock == 0, or a final node sequence → renew_node_zero_timelock (L1-deposit roots)
  * - node timelock < 200 → renew_node_timelock (splices in a zero-timelock
  *   "split node", resets node+refund to 2000)
  * - otherwise → renew_refund_timelock (decrements node by 100, resets refund to 2000)
  */
-public suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal {
-    val leaves = getLeaves()
+public suspend fun SparkWallet.renewExhaustedLeaves(): SparkLeafRenewal = renewLeaves(getLeaves())
+
+/**
+ * Renew the renewable leaves among [leaves] (refund timelock in [100, 200)) and report the ones
+ * below the renewal minimum as failures. Each renewal is independent: one failing leaf never
+ * stops the others.
+ */
+internal suspend fun SparkWallet.renewLeaves(leaves: List<SparkLeaf>): SparkLeafRenewal {
     val (needing, stuck) = renewalCandidates(leaves)
     // The coordinator refuses to renew a leaf whose refund timelock is already below one
     // interval (100 blocks); report those without a round trip.
@@ -144,15 +163,38 @@ internal fun renewalCandidates(leaves: List<SparkLeaf>): RenewalCandidates {
     return RenewalCandidates(renewable, stuck)
 }
 
+/** The renewal the coordinator accepts for a leaf. */
+internal enum class RenewalVariant {
+    ZERO_TIMELOCK,
+    NODE_TIMELOCK,
+    REFUND_TIMELOCK,
+}
+
+/**
+ * The renewal the coordinator accepts for a leaf, from its node transaction's sequence:
+ * zero-timelock renewal for a node timelock of 0 or a final (timelock-disabled, bit 31) sequence —
+ * a legacy deposit root's, which cannot be decremented (`validateRenewZeroTimelock`) — node
+ * renewal below 200, refund renewal otherwise.
+ */
+internal fun renewalVariant(nodeSequence: UInt): RenewalVariant {
+    val timelockDisabled = nodeSequence and (1u shl 31) != 0u
+    val nodeTimelock = nodeSequence and 0xFFFFu
+    return when {
+        nodeTimelock == 0u || timelockDisabled -> RenewalVariant.ZERO_TIMELOCK
+        nodeTimelock < RENEWAL_THRESHOLD -> RenewalVariant.NODE_TIMELOCK
+        else -> RenewalVariant.REFUND_TIMELOCK
+    }
+}
+
 private suspend fun SparkWallet.renewLeaf(node: Spark.TreeNode, parents: Map<String, Spark.TreeNode>) {
-    val nodeTimelock = parseSequenceFromRawTx(node.nodeTx.toByteArray()) and 0xFFFFu
-    if (nodeTimelock == 0u) {
+    val variant = renewalVariant(parseSequenceFromRawTx(node.nodeTx.toByteArray()))
+    if (variant == RenewalVariant.ZERO_TIMELOCK) {
         renewZeroTimelockNode(node)
         return
     }
     val parent = (if (node.hasParentNodeId()) parents[node.parentNodeId] else null)
         ?: throw SparkError.InvalidResponse("Parent node ${node.parentNodeId} not found for leaf ${node.id}")
-    if (nodeTimelock < RENEWAL_THRESHOLD) {
+    if (variant == RenewalVariant.NODE_TIMELOCK) {
         renewNodeTimelock(node, parent)
     } else {
         renewRefundTimelock(node, parent)
@@ -164,47 +206,16 @@ private suspend fun SparkWallet.renewLeaf(node: Spark.TreeNode, parents: Map<Str
 /** Refund-only renewal: new node tx with timelock −100, fresh refunds at 2000. */
 private suspend fun SparkWallet.renewRefundTimelock(node: Spark.TreeNode, parent: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
-    val parentTx = parent.nodeTx.toByteArray()
-    val address = BitcoinAddress.p2trAddress(
-        scriptPubKey = parseTxOutput(parentTx, 0u).scriptPubKey,
-        network = config.network,
-    )
-
-    val nodeSequence = parseSequenceFromRawTx(node.nodeTx.toByteArray())
-    val bit30 = nodeSequence and (1u shl 30)
-    val nodeTimelock = nodeSequence and 0xFFFFu
-    if (nodeTimelock < SPARK_TIME_LOCK_INTERVAL.toUInt()) {
-        throw SparkError.LeafTimelockExhausted("Node timelock $nodeTimelock too low for refund renewal")
-    }
-    val newNodeSequence = bit30 or (nodeTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt())
-
-    val nodePair = constructNodeTxPair(
-        parentTx = parentTx,
-        vout = 0u,
-        address = address,
-        sequence = newNodeSequence,
-        directSequence = newNodeSequence + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
-    val trio = constructRefundTxTrio(
-        cpfpNodeTx = nodePair.cpfp.tx,
-        directNodeTx = nodePair.direct.tx,
-        vout = 0u,
-        receivingPubkey = context.signingPublicKey,
-        network = config.network.networkString,
-        sequence = RENEWAL_INITIAL_SEQUENCE,
-        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
+    val txs = refundRenewalTransactions(node, parent, context.signingPublicKey, config)
 
     // Order defines which SO commitment each job consumes.
     val specs = mutableListOf(
-        SigningSpec("node", nodePair.cpfp.tx, nodePair.cpfp.sighash),
-        SigningSpec("directNode", nodePair.direct.tx, nodePair.direct.sighash),
-        SigningSpec("cpfp", trio.cpfpRefund.tx, trio.cpfpRefund.sighash),
+        SigningSpec("node", txs.node.cpfp.tx, txs.node.cpfp.sighash),
+        SigningSpec("directNode", txs.node.direct.tx, txs.node.direct.sighash),
+        SigningSpec("cpfp", txs.refunds.cpfpRefund.tx, txs.refunds.cpfpRefund.sighash),
     )
-    trio.directRefund?.let { specs.add(SigningSpec("direct", it.tx, it.sighash)) }
-    specs.add(SigningSpec("directFromCpfp", trio.directFromCpfpRefund.tx, trio.directFromCpfpRefund.sighash))
+    txs.refunds.directRefund?.let { specs.add(SigningSpec("direct", it.tx, it.sighash)) }
+    specs.add(SigningSpec("directFromCpfp", txs.refunds.directFromCpfpRefund.tx, txs.refunds.directFromCpfpRefund.sighash))
 
     val jobs = signRenewalJobs(specs, context)
 
@@ -219,7 +230,7 @@ private suspend fun SparkWallet.renewRefundTimelock(node: Spark.TreeNode, parent
         .setLeafId(node.id)
         .setRenewRefundTimelockSigningJob(renewJob.build())
         .build()
-    submitRenewal(request, node.id)
+    submitRenewal(request, node)
 }
 
 /**
@@ -228,54 +239,18 @@ private suspend fun SparkWallet.renewRefundTimelock(node: Spark.TreeNode, parent
  */
 private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
-    val parentTx = parent.nodeTx.toByteArray()
-    val address = BitcoinAddress.p2trAddress(
-        scriptPubKey = parseTxOutput(parentTx, 0u).scriptPubKey,
-        network = config.network,
-    )
-
-    // Split node: spends the parent output with zero timelock.
-    val splitPair = constructNodeTxPair(
-        parentTx = parentTx,
-        vout = 0u,
-        address = address,
-        sequence = 0u,
-        directSequence = SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
-    // New node: spends the split node output at the initial timelock.
-    val splitAddress = BitcoinAddress.p2trAddress(
-        scriptPubKey = parseTxOutput(splitPair.cpfp.tx, 0u).scriptPubKey,
-        network = config.network,
-    )
-    val nodePair = constructNodeTxPair(
-        parentTx = splitPair.cpfp.tx,
-        vout = 0u,
-        address = splitAddress,
-        sequence = RENEWAL_INITIAL_SEQUENCE,
-        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
-    val trio = constructRefundTxTrio(
-        cpfpNodeTx = nodePair.cpfp.tx,
-        directNodeTx = nodePair.direct.tx,
-        vout = 0u,
-        receivingPubkey = context.signingPublicKey,
-        network = config.network.networkString,
-        sequence = RENEWAL_INITIAL_SEQUENCE,
-        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
+    val txs = nodeRenewalTransactions(node, parent, context.signingPublicKey, config)
+    val split = txs.split ?: throw SparkError.InvalidResponse("Node renewal for leaf ${node.id} built no split node")
 
     val specs = mutableListOf(
-        SigningSpec("split", splitPair.cpfp.tx, splitPair.cpfp.sighash),
-        SigningSpec("directSplit", splitPair.direct.tx, splitPair.direct.sighash),
-        SigningSpec("node", nodePair.cpfp.tx, nodePair.cpfp.sighash),
-        SigningSpec("directNode", nodePair.direct.tx, nodePair.direct.sighash),
-        SigningSpec("cpfp", trio.cpfpRefund.tx, trio.cpfpRefund.sighash),
+        SigningSpec("split", split.cpfp.tx, split.cpfp.sighash),
+        SigningSpec("directSplit", split.direct.tx, split.direct.sighash),
+        SigningSpec("node", txs.node.cpfp.tx, txs.node.cpfp.sighash),
+        SigningSpec("directNode", txs.node.direct.tx, txs.node.direct.sighash),
+        SigningSpec("cpfp", txs.refunds.cpfpRefund.tx, txs.refunds.cpfpRefund.sighash),
     )
-    trio.directRefund?.let { specs.add(SigningSpec("direct", it.tx, it.sighash)) }
-    specs.add(SigningSpec("directFromCpfp", trio.directFromCpfpRefund.tx, trio.directFromCpfpRefund.sighash))
+    txs.refunds.directRefund?.let { specs.add(SigningSpec("direct", it.tx, it.sighash)) }
+    specs.add(SigningSpec("directFromCpfp", txs.refunds.directFromCpfpRefund.tx, txs.refunds.directFromCpfpRefund.sighash))
 
     val jobs = signRenewalJobs(specs, context)
 
@@ -292,7 +267,7 @@ private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: 
         .setLeafId(node.id)
         .setRenewNodeTimelockSigningJob(renewJob.build())
         .build()
-    submitRenewal(request, node.id)
+    submitRenewal(request, node)
 }
 
 /**
@@ -301,37 +276,13 @@ private suspend fun SparkWallet.renewNodeTimelock(node: Spark.TreeNode, parent: 
  */
 private suspend fun SparkWallet.renewZeroTimelockNode(node: Spark.TreeNode) {
     val context = RenewalContext(node, signer)
-    val nodeTx = node.nodeTx.toByteArray()
-    val address = BitcoinAddress.p2trAddress(
-        scriptPubKey = parseTxOutput(nodeTx, 0u).scriptPubKey,
-        network = config.network,
-    )
-
-    val nodePair = constructNodeTxPair(
-        parentTx = nodeTx,
-        vout = 0u,
-        address = address,
-        sequence = 0u,
-        directSequence = SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
-    // Zero-timelock node → no direct node context for the refunds.
-    val trio = constructRefundTxTrio(
-        cpfpNodeTx = nodePair.cpfp.tx,
-        directNodeTx = null,
-        vout = 0u,
-        receivingPubkey = context.signingPublicKey,
-        network = config.network.networkString,
-        sequence = RENEWAL_INITIAL_SEQUENCE,
-        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
-    )
+    val txs = zeroTimelockRenewalTransactions(node, context.signingPublicKey, config)
 
     val specs = listOf(
-        SigningSpec("node", nodePair.cpfp.tx, nodePair.cpfp.sighash),
-        SigningSpec("directNode", nodePair.direct.tx, nodePair.direct.sighash),
-        SigningSpec("cpfp", trio.cpfpRefund.tx, trio.cpfpRefund.sighash),
-        SigningSpec("directFromCpfp", trio.directFromCpfpRefund.tx, trio.directFromCpfpRefund.sighash),
+        SigningSpec("node", txs.node.cpfp.tx, txs.node.cpfp.sighash),
+        SigningSpec("directNode", txs.node.direct.tx, txs.node.direct.sighash),
+        SigningSpec("cpfp", txs.refunds.cpfpRefund.tx, txs.refunds.cpfpRefund.sighash),
+        SigningSpec("directFromCpfp", txs.refunds.directFromCpfpRefund.tx, txs.refunds.directFromCpfpRefund.sighash),
     )
 
     val jobs = signRenewalJobs(specs, context)
@@ -347,8 +298,112 @@ private suspend fun SparkWallet.renewZeroTimelockNode(node: Spark.TreeNode) {
         .setLeafId(node.id)
         .setRenewNodeZeroTimelockSigningJob(renewJob)
         .build()
-    submitRenewal(request, node.id)
+    submitRenewal(request, node)
 }
+
+// ── Renewal transactions (what the operators rebuild, renew_leaf_handler.go) ──
+
+/** The transactions of one renewal: the split node (node renewal only), the new node pair and its refunds. */
+internal class RenewalTransactions(val split: NodeTxPairResult?, val node: NodeTxPairResult, val refunds: RefundTxTrioResult)
+
+/**
+ * The P2TR address a leaf's node transaction pays: the leaf's verifying key with the BIP-86
+ * key-path tweak (`P2TRScriptFromPubKey(leaf.VerifyingPubkey)` on the operators).
+ */
+internal fun leafNodeAddress(verifyingKey: ByteArray, network: SparkNetwork): String {
+    val tweaked = getTaprootPubkey(verifyingKey)
+    if (tweaked.size != 33) {
+        throw SparkError.InvalidResponse("Unexpected taproot key length ${tweaked.size}")
+    }
+    return BitcoinAddress.p2trAddress(scriptPubKey = byteArrayOf(0x51, 0x20) + tweaked.copyOfRange(1, 33), network = network)
+}
+
+/**
+ * Refund renewal: a new node transaction spending the parent's output `node.vout` at the node
+ * timelock minus 100, paying the leaf's node address, and fresh refunds at 2000.
+ */
+internal fun refundRenewalTransactions(node: Spark.TreeNode, parent: Spark.TreeNode, signingPublicKey: ByteArray, config: SparkConfig,): RenewalTransactions {
+    val nodeSequence = parseSequenceFromRawTx(node.nodeTx.toByteArray())
+    val bit30 = nodeSequence and (1u shl 30)
+    val nodeTimelock = nodeSequence and 0xFFFFu
+    if (nodeTimelock < SPARK_TIME_LOCK_INTERVAL.toUInt()) {
+        throw SparkError.LeafTimelockExhausted("Node timelock $nodeTimelock too low for refund renewal")
+    }
+    val newNodeSequence = bit30 or (nodeTimelock - SPARK_TIME_LOCK_INTERVAL.toUInt())
+    val nodePair = constructNodeTxPair(
+        parentTx = parent.nodeTx.toByteArray(),
+        vout = node.vout.toUInt(),
+        address = leafNodeAddress(node.verifyingPublicKey.toByteArray(), config.network),
+        sequence = newNodeSequence,
+        directSequence = newNodeSequence + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+    return RenewalTransactions(split = null, node = nodePair, refunds = initialRefunds(nodePair, signingPublicKey, config))
+}
+
+/**
+ * Node renewal: a zero-timelock split node spending the parent's output `node.vout`, a new node
+ * transaction at 2000 spending it, both paying the leaf's node address, and fresh refunds at 2000.
+ */
+internal fun nodeRenewalTransactions(node: Spark.TreeNode, parent: Spark.TreeNode, signingPublicKey: ByteArray, config: SparkConfig,): RenewalTransactions {
+    val address = leafNodeAddress(node.verifyingPublicKey.toByteArray(), config.network)
+    val splitPair = constructNodeTxPair(
+        parentTx = parent.nodeTx.toByteArray(),
+        vout = node.vout.toUInt(),
+        address = address,
+        sequence = 0u,
+        directSequence = SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+    val nodePair = constructNodeTxPair(
+        parentTx = splitPair.cpfp.tx,
+        vout = 0u,
+        address = address,
+        sequence = RENEWAL_INITIAL_SEQUENCE,
+        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+    return RenewalTransactions(split = splitPair, node = nodePair, refunds = initialRefunds(nodePair, signingPublicKey, config))
+}
+
+/**
+ * Zero-timelock renewal: another zero-timelock node spending the leaf's own node transaction
+ * (output 0), and fresh refunds at 2000 without a direct refund.
+ */
+internal fun zeroTimelockRenewalTransactions(node: Spark.TreeNode, signingPublicKey: ByteArray, config: SparkConfig): RenewalTransactions {
+    val nodePair = constructNodeTxPair(
+        parentTx = node.nodeTx.toByteArray(),
+        vout = 0u,
+        address = leafNodeAddress(node.verifyingPublicKey.toByteArray(), config.network),
+        sequence = 0u,
+        directSequence = SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+    // Zero-timelock node → no direct node context for the refunds.
+    val refunds = constructRefundTxTrio(
+        cpfpNodeTx = nodePair.cpfp.tx,
+        directNodeTx = null,
+        vout = 0u,
+        receivingPubkey = signingPublicKey,
+        network = config.network.networkString,
+        sequence = RENEWAL_INITIAL_SEQUENCE,
+        directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+    )
+    return RenewalTransactions(split = null, node = nodePair, refunds = refunds)
+}
+
+/** Refunds at the initial timelock (2000) spending a renewed node pair. */
+private fun initialRefunds(nodePair: NodeTxPairResult, signingPublicKey: ByteArray, config: SparkConfig): RefundTxTrioResult = constructRefundTxTrio(
+    cpfpNodeTx = nodePair.cpfp.tx,
+    directNodeTx = nodePair.direct.tx,
+    vout = 0u,
+    receivingPubkey = signingPublicKey,
+    network = config.network.networkString,
+    sequence = RENEWAL_INITIAL_SEQUENCE,
+    directSequence = RENEWAL_INITIAL_SEQUENCE + SPARK_DIRECT_TIMELOCK_OFFSET.toUInt(),
+    feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
+)
 
 // ── Shared plumbing ─────────────────────────────────────────────────────────
 
@@ -390,10 +445,21 @@ private suspend fun SparkWallet.signRenewalJobs(specs: List<SigningSpec>, contex
     return jobs
 }
 
-private suspend fun SparkWallet.submitRenewal(request: Spark.RenewLeafRequest, leafId: String) {
-    val stub = getCoordinatorStub()
+/**
+ * Submits a renewal under the idempotency key [renewalIdempotencyKey], so the transport's retry
+ * of a renewal the operators already applied gets their answer instead of failing.
+ */
+private suspend fun SparkWallet.submitRenewal(request: Spark.RenewLeafRequest, renewing: Spark.TreeNode) {
+    val stub = getCoordinatorStubWithIdempotency(renewalIdempotencyKey(renewing))
     val response = stub.renewLeaf(request)
     if (response.renewResultCase == Spark.RenewLeafResponse.RenewResultCase.RENEWRESULT_NOT_SET) {
-        throw SparkError.InvalidResponse("renew_leaf returned no result for leaf $leafId")
+        throw SparkError.InvalidResponse("renew_leaf returned no result for leaf ${renewing.id}")
     }
 }
+
+/**
+ * A leaf renewal's idempotency key: the txid of the refund transaction being replaced, as the
+ * reference SDK keys all three renewal variants. It changes with every renewal, so it names
+ * exactly one.
+ */
+internal fun renewalIdempotencyKey(node: Spark.TreeNode): String = RawTransaction.parse(node.refundTx.toByteArray(), context = "refund tx").txidHex

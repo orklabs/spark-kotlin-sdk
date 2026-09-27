@@ -87,7 +87,8 @@ public suspend fun SparkWallet.withdraw(onChainAddress: String, amountSats: Long
 /**
  * Everything [withdrawAll] would do, without doing it: claims pending inbound transfers,
  * renews renewable leaves, and quotes the SSP fee for every spendable leaf. Use it to show
- * the user what will move, what it costs, and what stays behind ([WithdrawAllQuote.frozenSats]).
+ * the user what will move, what it costs, and what stays behind ([WithdrawAllQuote.frozenSats],
+ * [WithdrawAllQuote.unrenewedSats]).
  */
 public suspend fun SparkWallet.quoteWithdrawAll(onChainAddress: String): WithdrawAllQuote {
     val plan = drainPlan(onChainAddress)
@@ -95,6 +96,7 @@ public suspend fun SparkWallet.quoteWithdrawAll(onChainAddress: String): Withdra
         spendableSats = plan.spendableSats,
         quotedFeeSats = plan.quotedFeeSats,
         frozenSats = plan.balance.frozen,
+        unrenewedSats = plan.unrenewedSats,
         lockedSats = plan.balance.locked,
         incomingSats = plan.balance.incoming,
         leafCount = plan.leaves.size,
@@ -105,10 +107,13 @@ public suspend fun SparkWallet.quoteWithdrawAll(onChainAddress: String): Withdra
  * Send every spendable sat to [onChainAddress] in one cooperative exit.
  *
  * Pending inbound transfers are claimed first and renewable leaves renewed, then every
- * spendable leaf is exited; the SSP's fee comes out of that amount. Leaves at the timelock
- * floor cannot be included: they are reported in the result as
- * [WithdrawAllResult.frozenSats], as are sats locked by in-flight operations and inbound sats
- * that could not be claimed. The same response verification and fee bound as [withdraw] apply.
+ * spendable leaf is exited; the SSP's fee comes out of that amount. Frozen leaves (refund
+ * timelock below 100) cannot be included and are reported in the result as
+ * [WithdrawAllResult.frozenSats]; leaves whose renewal failed as
+ * [WithdrawAllResult.unrenewedSats], sats locked by in-flight operations as
+ * [WithdrawAllResult.lockedSats] and inbound sats that could not be claimed as
+ * [WithdrawAllResult.unclaimedSats]. The same response verification and fee bound as [withdraw]
+ * apply.
  *
  * @param onChainAddress Destination Bitcoin address on the wallet's network.
  * @param maxFeeSats Highest fee the caller accepts; `null` uses the SSP's own quote.
@@ -136,12 +141,16 @@ public suspend fun SparkWallet.withdrawAll(onChainAddress: String, maxFeeSats: L
         sentSats = plan.spendableSats,
         payoutSats = exit.payoutSats,
         frozenSats = plan.balance.frozen,
+        unrenewedSats = plan.unrenewedSats,
         lockedSats = plan.balance.locked,
         unclaimedSats = plan.balance.incoming,
     )
 }
 
-private class DrainPlan(val leaves: List<SparkLeaf>, val balance: SatsBalance, val spendableSats: Long, val quotedFeeSats: Long)
+private class DrainPlan(val leaves: List<SparkLeaf>, val balance: SatsBalance, val spendableSats: Long, val quotedFeeSats: Long) {
+    /** Available sats that are not spendable after the renewal pass: leaves at 100…199 the operators did not renew. */
+    val unrenewedSats: Long get() = maxOf(0L, balance.available - spendableSats)
+}
 
 /**
  * Shared prelude of [quoteWithdrawAll] and [withdrawAll]: validate the destination, claim
@@ -362,18 +371,14 @@ internal fun buildConnectorRefunds(
 ): ConnectorRefunds {
     val (cpfpSequence, directSequence) = computeNextSequences(node.refundTx.toByteArray())
     val cpfpNodeTx = node.nodeTx.toByteArray()
-    val isZeroNode = isZeroTimelockNode(cpfpNodeTx)
-    val directNodeTx: ByteArray? = if (node.directTx.isEmpty || isZeroNode) null else node.directTx.toByteArray()
+    val directNodeTx = directNodeTxForRefund(node)
 
-    val trio = constructRefundTxTrio(
-        cpfpNodeTx = cpfpNodeTx,
-        directNodeTx = directNodeTx,
-        vout = 0u,
+    val trio = leafRefundTrio(
+        node = node,
         receivingPubkey = receiverPubKey,
         network = network,
         sequence = cpfpSequence,
         directSequence = directSequence,
-        feeSats = SPARK_DEFAULT_FEE_SATS.toULong(),
     )
     val connectorOutput = connectorTx.output(connectorVout)
     val connectorInput = RawTransaction.Input(previousTxid = connectorTxid, previousIndex = connectorVout)

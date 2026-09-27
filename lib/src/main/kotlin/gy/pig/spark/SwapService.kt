@@ -11,10 +11,10 @@ import java.util.UUID
  * `AVAILABLE` leaves that can be sent right now.
  *
  * Leaves whose refund timelock is in the coordinator's renewable range are renewed first
- * (best effort, as the reference SDK's leaf manager does before every spend). Leaves at the
- * timelock floor are left out: the coordinator will neither move nor renew them, so including
- * them would only make the whole operation fail. Their sats are reported as
- * [SatsBalance.frozen]. Every spend path ([send], [payLightningInvoice], [withdraw],
+ * (best effort, as the reference SDK's leaf manager does before every spend). Leaves that still
+ * cannot move are left out, since including them would only make the whole operation fail:
+ * frozen leaves (refund timelock below 100, reported as [SatsBalance.frozen]) and any renewable
+ * leaf the operators did not renew. Every spend path ([send], [payLightningInvoice], [withdraw],
  * [withdrawAll], swaps) selects from this set, so it is also the right basis for an app's
  * "send everything" amount.
  */
@@ -27,7 +27,7 @@ public suspend fun SparkWallet.getSpendableLeaves(): List<SparkLeaf> {
     return movableLeaves(leaves)
 }
 
-/** Leaves whose refund timelock is above the floor and can therefore be transferred. */
+/** Leaves whose rounded refund timelock is above the floor and can therefore be transferred ([isSpendable]). */
 internal fun movableLeaves(leaves: List<SparkLeaf>): List<SparkLeaf> = leaves.filter { it.isSpendable }
 
 /**
@@ -44,10 +44,12 @@ internal suspend fun SparkWallet.selectLeavesWithSwap(amountSats: Long): List<Sp
     tryExactSelection(leaves, amountSats)?.let { return it }
 
     // No exact match — swap leaves via SSP to get right denominations
-    val newLeaves = requestLeavesSwap(targetAmounts = listOf(amountSats))
+    requestLeavesSwap(targetAmounts = listOf(amountSats))
 
-    // Retry selection with new leaves (must find exact match — never overspend)
-    return tryExactSelection(movableLeaves(newLeaves), amountSats)
+    // Retry selection with the swap's output (must find exact match — never overspend). The SSP
+    // may return leaves in the renewal range; renew them rather than leave them out, as the
+    // reference SDK does before it uses swap outputs.
+    return tryExactSelection(getSpendableLeaves(), amountSats)
         ?: throw SparkError.InvalidResponse("Failed to select leaves for target amount $amountSats after swap")
 }
 
@@ -312,18 +314,22 @@ internal suspend fun SparkWallet.processSwapBatch(leaves: List<SparkLeaf>, targe
     return getLeaves()
 }
 
+/**
+ * A transfer this wallet sent or receives, by id, from the operators' by-id lookup
+ * (`query_transfers_by_id`, the reference SDK's `queryTransfer`): the whole transfer, every
+ * receiver's leaves included.
+ */
 internal suspend fun SparkWallet.queryTransferById(transferId: String): Spark.Transfer =
     queryTransferByIdOrNull(transferId) ?: throw SparkError.InvalidResponse("Transfer not found: $transferId")
 
 /** The transfer with [transferId] in which this wallet takes part, or `null` when the coordinator has none. */
 internal suspend fun SparkWallet.queryTransferByIdOrNull(transferId: String): Spark.Transfer? {
     val stub = getCoordinatorStub()
-    val filter = Spark.TransferFilter.newBuilder()
-        .setSenderOrReceiverIdentityPublicKey(ByteString.copyFrom(signer.identityPublicKey))
+    val request = Spark.QueryTransfersByIdRequest.newBuilder()
         .addTransferIds(transferId)
         .setNetwork(config.network.toProto())
         .build()
-    val response = stub.queryAllTransfers(filter)
+    val response = stub.queryTransfersById(request)
     // Only the transfer that was asked for (UUIDs compare case-insensitively).
     return response.transfersList.firstOrNull { it.id.equals(transferId, ignoreCase = true) }
 }
