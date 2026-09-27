@@ -555,10 +555,11 @@ SPARK_FROST_HOST_LIBRARY=/path/to/libspark_frost.dylib ./gradlew :lib:testDebugU
 ### Integration tests (live network, real funds)
 
 Integration tests connect to live Spark operators and submit real transactions. They
-require funded test wallets and a connected device / emulator:
+require funded test wallets and a device / emulator (`ANDROID_SERIAL` picks one when several
+are connected); spending on-chain is opt-in per test:
 
 ```bash
-./gradlew :lib:connectedAndroidTest
+ANDROID_SERIAL=emulator-5554 ./gradlew :lib:connectedDebugAndroidTest
 ```
 
 > ⚠️ **Never commit funded mnemonics.** Move them to environment variables read at

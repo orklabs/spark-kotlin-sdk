@@ -102,20 +102,28 @@ vector and require no configuration.
 
 ### Integration tests (live network, real funds)
 
-Integration tests connect to live Spark operators and submit real transactions.
-**They require funded test wallets and a connected device or emulator.**
+Integration tests connect to live Spark operators on mainnet and submit real transactions.
+**They require funded test wallets and a device or emulator** (arm64 on Apple Silicon, so the
+bundled `libspark_frost.so` loads). The suites mirror the Swift SDK's live tests:
+`IntegrationTests.kt` (wallet, deposits, Lightning, transfers, tokens, …) and
+`HardeningIntegrationTests.kt`.
 
 ```bash
-adb devices                              # confirm a device is connected
-./gradlew :lib:connectedAndroidTest
+adb devices                                   # pick the device to test on
+export ANDROID_SERIAL=emulator-5554           # otherwise every connected device runs them
+./gradlew :lib:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.timeout_msec=420000
+# One suite or test:
+#   -Pandroid.testInstrumentationRunnerArguments.class=gy.pig.spark.HardeningIntegrationTests
+#   -Pandroid.testInstrumentationRunnerArguments.class=gy.pig.spark.TokenIntegrationTests#twoConcurrentSendsFromOneWalletBothLandOnDifferentOutputs
 ```
 
 Funded mnemonics and other live-network inputs are supplied through **either**
-`local.properties` (preferred) **or** environment variables. Both are loaded at
-Gradle configure time and exposed to instrumented tests via `BuildConfig` fields,
-which are read through the [`TestConfig`](lib/src/androidTest/kotlin/gy/pig/spark/TestConfig.kt)
-helper. See `lib/src/androidTest/kotlin/gy/pig/spark/IntegrationTests.kt` for the
-call sites.
+`local.properties` (preferred) **or** environment variables (the Swift SDK's `.env` names, so
+`set -a; source ../spark-swift-sdk/.env; set +a` works). Both are loaded at Gradle configure
+time into the instrumented-test APK's own `BuildConfig` (`gy.pig.spark.test.BuildConfig`, never
+the library's) and read through the
+[`TestConfig`](lib/src/androidTest/kotlin/gy/pig/spark/TestConfig.kt) helper.
 
 **Option A — `local.properties` (recommended for local dev).** Already gitignored.
 Add the entries below alongside `sdk.dir=…`:
@@ -124,6 +132,12 @@ Add the entries below alongside `sdk.dir=…`:
 spark.test.walletA.mnemonic=word1 word2 ... word12
 spark.test.walletB.mnemonic=word1 word2 ... word12
 spark.test.lnAddress=user@host
+# Optional: the static-deposit suite
+spark.test.staticDeposit.mnemonic=word1 word2 ... word12
+spark.test.staticDeposit.account=11
+spark.test.staticDeposit.address=bc1p...
+spark.test.staticDeposit.txid=<txid>
+spark.test.staticDeposit.withdrawAddress=bc1...
 ```
 
 **Option B — environment variables (recommended for CI / one-off runs).** Copy
@@ -134,18 +148,31 @@ Gradle, or export the variables in your shell profile:
 cp .env.example .env.local
 # edit .env.local
 set -a; source .env.local; set +a
-./gradlew :lib:connectedAndroidTest
+./gradlew :lib:connectedDebugAndroidTest
 ```
 
 | Gradle key (`local.properties`) | Env var | Required | Purpose |
 |---|---|---|---|
 | `spark.test.walletA.mnemonic` | `SPARK_TEST_WALLET_A_MNEMONIC` | for any test | Funded with ≥ 500 sats |
 | `spark.test.walletB.mnemonic` | `SPARK_TEST_WALLET_B_MNEMONIC` | for any test | Does not need funds |
-| `spark.test.lnAddress`        | `SPARK_TEST_LN_ADDRESS`        | for LN tests | LNURL-pay recipient |
+| `spark.test.lnAddress`        | `SPARK_TEST_LN_ADDRESS` (or `SPARK_TEST_LIGHTNING_ADDRESS`) | for LN tests | LNURL-pay recipient |
+| `spark.test.staticDeposit.*`  | `SPARK_TEST_STATIC_DEPOSIT_MNEMONIC`, `_ACCOUNT`, `_ADDRESS`, `_TXID`, `_WITHDRAW_ADDRESS` | static-deposit suite | A wallet with a funded static deposit |
 
-Tests that need a value the runner did not supply **skip** via JUnit's `Assume`
-mechanism — they never fail. Run the full suite end-to-end only after populating
-both wallet entries.
+Tests that need a value the runner did not supply, or more sats than the wallets hold,
+**skip** via JUnit's `Assume` mechanism, with the reason. The hardening suite sends from
+whichever test wallet can spend more; the token suites use whichever wallet issued the test
+token. Tests that spend on-chain or take long are opt-in, through instrumentation arguments
+(`-Pandroid.testInstrumentationRunnerArguments.<name>=<value>`), named as the Swift suite's
+environment variables:
+
+| Argument | Test |
+|---|---|
+| `SPARK_TEST_ALLOW_WITHDRAW=1` | a small cooperative exit (`SPARK_TEST_WITHDRAW_SATS`, default 3,000; `SPARK_TEST_WITHDRAW_MAX_FEE_SATS`, default 2,500) |
+| `SPARK_TEST_ALLOW_WITHDRAW_ALL=1` | `withdrawAll` of the sending wallet |
+| `SPARK_TEST_WITHDRAW_DESTINATION` | an address, or `receiver-static-deposit` to pay the other wallet's static address (default: the static-deposit withdraw address) |
+| `SPARK_TEST_CLAIM_STATIC=A` / `B` | claim that wallet's confirmed static deposits (`SPARK_TEST_CLAIM_STATIC_TXID=<txid>:<vout>` for one not indexed yet) |
+| `SPARK_TEST_ALLOW_REFUND=1` | refund an unclaimed static deposit to the wallet's own static address, and broadcast it |
+| `SPARK_TEST_RENEWAL=1` | bounce a leaf between the wallets until a claim renews it |
 
 > ⚠️ **Never commit mnemonics.** A mnemonic committed to git history is compromised
 > forever — rotate the funds immediately. `.env.local`, `local.properties`, `.env`,

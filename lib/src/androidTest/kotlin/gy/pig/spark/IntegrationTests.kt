@@ -1,1175 +1,1202 @@
 package gy.pig.spark
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import kotlinx.coroutines.runBlocking
-import org.junit.After
-import org.junit.Assert.*
+import com.google.protobuf.ByteString
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
+import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
+import spark.Spark
+import spark_token.QueryTokenTransactionsByTxHash
+import spark_token.QueryTokenTransactionsRequest
+import spark_token.TokenTransactionStatus
 import java.math.BigInteger
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 
-/**
- * Integration tests run against live Spark operators and submit real transactions.
- *
- * Mnemonics and Lightning addresses are loaded by [TestConfig] from `local.properties`
- * or environment variables — never hardcoded. See [TestConfig] for the keys and
- * `CONTRIBUTING.md` for the full setup. Tests skip (via JUnit `Assume`) when the
- * secrets are not configured, so they never fail in CI / on contributors' machines.
- *
- * **Never** commit a real mnemonic or write one to logs.
- */
+// Integration tests run against live Spark operators and submit real transactions. A port of the
+// Swift SDK's `IntegrationTests.swift`, suite for suite, plus a few Kotlin-only checks.
+//
+// Mnemonics and Lightning addresses are loaded by [TestConfig] from `local.properties` or
+// environment variables — never hardcoded. See [TestConfig] for the keys and `CONTRIBUTING.md`
+// for the full setup. Tests skip (via JUnit `Assume`) when the secrets are not configured, so they
+// never fail in CI / on contributors' machines, and when the wallets hold fewer sats than a test
+// needs (the Swift suite records an issue there).
+//
+// **Never** commit a real mnemonic or write one to logs.
+
 private val WALLET_A_MNEMONIC: String get() = TestConfig.walletAMnemonic
 private val WALLET_B_MNEMONIC: String get() = TestConfig.walletBMnemonic
-private val MINIMUM_TEST_BALANCE: Long = TestConfig.MINIMUM_BALANCE_SATS
+private const val MINIMUM_TEST_BALANCE: Long = TestConfig.MINIMUM_BALANCE_SATS
+private const val MINUTE = 60_000L
 
-/** Resolves a lightning address (user@domain) to a BOLT11 invoice via LNURL-pay */
-fun resolveLightningAddress(address: String, amountSats: Long): String {
-    val parts = address.split("@")
-    require(parts.size == 2) { "Invalid lightning address format" }
-    val client = okhttp3.OkHttpClient()
-
-    val lnurlResp = client.newCall(
-        okhttp3.Request.Builder().url("https://${parts[1]}/.well-known/lnurlp/${parts[0]}").build()
-    ).execute()
-    val lnurlJson = org.json.JSONObject(lnurlResp.body!!.string())
-    val callback = lnurlJson.getString("callback")
-
-    val invoiceResp = client.newCall(
-        okhttp3.Request.Builder().url("$callback?amount=${amountSats * 1000}").build()
-    ).execute()
-    val invoiceJson = org.json.JSONObject(invoiceResp.body!!.string())
-    return invoiceJson.getString("pr")
+/** Skips the calling test unless [balance] is at least [sats]. */
+private fun needsSats(label: String, balance: Long, sats: Long) {
+    assumeTrue("$label needs >= $sats sats (has $balance)", balance >= sats)
 }
 
-// One live-network suite mirroring the Swift SDK's IntegrationTests; splitting it would only
-// duplicate the wallet setup and funding checks.
-@Suppress("LargeClass")
-@RunWith(AndroidJUnit4::class)
-class IntegrationTests {
-
-    private lateinit var walletA: SparkWallet
-    private lateinit var walletB: SparkWallet
-
+/** Base of the live suites: skips everything without configured wallets. */
+abstract class LiveSuite {
     @Before
-    fun setUp() {
-        // Skip the entire test class when secrets are not configured. CI runs
-        // unit tests only and never has these set; local devs configure them
-        // via `local.properties` or env vars (see `TestConfig`).
+    fun requireWallets() {
         TestConfig.requireMnemonics()
-        walletA = SparkWallet.fromMnemonic(config = SparkConfig(), mnemonic = WALLET_A_MNEMONIC, account = 0)
-        walletB = SparkWallet.fromMnemonic(config = SparkConfig(), mnemonic = WALLET_B_MNEMONIC, account = 0)
     }
+}
 
-    @After
-    fun tearDown() = runBlocking {
-        walletA.close()
-        walletB.close()
-    }
+// =============================================================================
+// Wallet Tests (matching JS: wallet.test.ts)
+// =============================================================================
 
-    // =========================================================================
-    // Balance Tests
-    // =========================================================================
-
+@RunWith(AndroidJUnit4::class)
+class WalletTests : LiveSuite() {
     @Test
-    fun queryBalance() = runBlocking {
-        val balance = walletA.getBalance()
-        println(
-            "Balance — available: ${balance.satsBalance.available} sats, " +
-                "owned: ${balance.satsBalance.owned} sats, " +
-                "incoming: ${balance.satsBalance.incoming} sats, " +
-                "${balance.leaves.size} leaves",
-        )
-        assertTrue(balance.satsBalance.available >= 0)
-        assertTrue(balance.satsBalance.owned >= balance.satsBalance.available)
+    fun shouldInitializeAWalletFromMnemonic() {
+        assertTrue(makeWallet(WALLET_A_MNEMONIC).identityPublicKeyHex.isNotEmpty())
     }
 
     @Test
-    fun queryLeaves() = runBlocking {
-        val leaves = walletA.getLeaves()
-        for (leaf in leaves) {
-            println("  Leaf ${leaf.id}: ${leaf.valueSats} sats [${leaf.status}]")
-            assertTrue(leaf.valueSats > 0)
-            assertEquals("AVAILABLE", leaf.status)
-        }
-    }
-
-    // =========================================================================
-    // Deposit Tests
-    // =========================================================================
-
-    @Test
-    fun generateDepositAddress() = runBlocking {
-        val deposit = walletA.getDepositAddress()
-        assertTrue(deposit.address.isNotEmpty())
-        assertTrue(deposit.address.startsWith("bc1p")) // P2TR address
-        println("Deposit address: ${deposit.address}")
+    fun differentAccountsProduceDifferentIdentityKeys() {
+        assertNotEquals(makeWallet(WALLET_A_MNEMONIC, account = 0).identityPublicKeyHex, makeWallet(WALLET_A_MNEMONIC, account = 1).identityPublicKeyHex)
     }
 
     @Test
-    fun generateStaticDepositAddress() = runBlocking {
-        val deposit = walletA.getStaticDepositAddress()
-        assertTrue(deposit.address.isNotEmpty())
-        assertTrue(deposit.address.startsWith("bc1p"))
-        println("Static deposit address: ${deposit.address}")
+    fun sameMnemonicAndAccountProduceTheSameIdentityKey() {
+        assertEquals(makeWallet(WALLET_A_MNEMONIC).identityPublicKeyHex, makeWallet(WALLET_A_MNEMONIC).identityPublicKeyHex)
     }
 
     @Test
-    fun staticDepositDeterministic() = runBlocking {
-        val w2 = SparkWallet.fromMnemonic(config = SparkConfig(), mnemonic = WALLET_A_MNEMONIC, account = 0)
-        val addr1 = walletA.getStaticDepositAddress()
-        val addr2 = w2.getStaticDepositAddress()
-        assertEquals(addr1.address, addr2.address)
-        w2.close()
+    fun twoDifferentMnemonicsProduceDifferentIdentityKeys() {
+        assertNotEquals(makeWallet(WALLET_A_MNEMONIC).identityPublicKeyHex, makeWallet(WALLET_B_MNEMONIC).identityPublicKeyHex)
+    }
+}
+
+// =============================================================================
+// Spark Address Tests (matching JS: address.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class SparkAddressTests : LiveSuite() {
+    @Test
+    fun shouldGenerateASparkAddressWithTheCorrectPrefix() {
+        val address = makeWallet(WALLET_A_MNEMONIC).getSparkAddress()
+        assertTrue(address.startsWith("spark1"))
+        assertTrue(address.length > 10)
+        println("Spark address: $address")
     }
 
     @Test
-    fun queryUnusedAddresses() = runBlocking {
-        val addresses = walletA.queryUnusedDepositAddresses()
-        println("Unused deposit addresses: ${addresses.size}")
-        for (addr in addresses) {
-            assertTrue(addr.address.isNotEmpty())
-            println("  ${addr.address} leafId=${addr.leafId}")
-        }
+    fun sameWalletProducesTheSameSparkAddress() {
+        assertEquals(makeWallet(WALLET_A_MNEMONIC).getSparkAddress(), makeWallet(WALLET_A_MNEMONIC).getSparkAddress())
     }
 
     @Test
-    fun multipleDepositAddresses() = runBlocking {
-        val countBefore = walletA.queryUnusedDepositAddresses().size
-        walletA.getDepositAddress()
-        walletA.getDepositAddress()
-        val countAfter = walletA.queryUnusedDepositAddresses().size
-        assertTrue(countAfter >= countBefore + 2)
+    fun differentWalletsProduceDifferentSparkAddresses() {
+        assertNotEquals(makeWallet(WALLET_A_MNEMONIC).getSparkAddress(), makeWallet(WALLET_B_MNEMONIC).getSparkAddress())
     }
+}
 
+// =============================================================================
+// Balance Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class BalanceTests : LiveSuite() {
     @Test
-    fun staticNotInUnused() = runBlocking {
-        val staticAddr = walletB.getStaticDepositAddress()
-        val unused = walletB.queryUnusedDepositAddresses()
-        val found = unused.any { it.address == staticAddr.address }
-        assertFalse(found)
-    }
-
-    @Test
-    fun depositFeeEstimate() = runBlocking {
-        val txID = "5e61b8909e4cd53fa3f33edde5571fa1f747eecf9cc7c00b17b5765e2eae77ac"
-        val estimate = walletA.getDepositFeeEstimate(transactionId = txID, outputIndex = 17u)
-        assertTrue(estimate.creditAmountSats > 0)
-        assertTrue(estimate.quoteSignature.isNotEmpty())
-        println("Credit amount: ${estimate.creditAmountSats} sats")
-    }
-
-    // =========================================================================
-    // Lightning Tests
-    // =========================================================================
-
-    @Test
-    fun createInvoice() = runBlocking {
-        val invoice = walletA.createLightningInvoice(amountSats = 100, memo = "test invoice")
-        assertTrue(invoice.paymentRequest.isNotEmpty())
-        assertTrue(invoice.paymentHash.isNotEmpty())
-        assertEquals(100L, invoice.amountSats)
-        assertTrue(invoice.paymentRequest.lowercase().startsWith("lnbc"))
-        println("Invoice: ${invoice.paymentRequest.take(50)}...")
-    }
-
-    @Test
-    fun createInvoiceNoMemo() = runBlocking {
-        val invoice = walletA.createLightningInvoice(amountSats = 50)
-        assertTrue(invoice.paymentRequest.isNotEmpty())
-    }
-
-    @Test
-    fun getSendFeeEstimate() = runBlocking {
-        val invoice = walletB.createLightningInvoice(amountSats = 100)
-        val fee = walletA.getLightningSendFeeEstimate(encodedInvoice = invoice.paymentRequest)
-        assertTrue(fee >= 0)
-        println("Fee estimate: $fee sats")
-    }
-
-    @Test
-    fun payInvoice() = runBlocking {
-        val balanceBefore = walletA.getBalance()
-        val availableBefore = balanceBefore.satsBalance.available
-        if (availableBefore < 100) {
-            println("WalletA needs >= 100 sats (has $availableBefore), skipping")
-            return@runBlocking
-        }
-
-        val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "integration test")
-        val paymentID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
-        assertTrue(paymentID.isNotEmpty())
-        println("Payment ID: $paymentID")
-
-        val balanceAfter = walletA.getBalance()
-        val availableAfter = balanceAfter.satsBalance.available
-        assertTrue(availableAfter < availableBefore)
-        println("WalletA: $availableBefore -> $availableAfter sats")
-    }
-
-    // =========================================================================
-    // Transfer Tests
-    // =========================================================================
-
-    @Test
-    fun payLightningAddress() = runBlocking {
-        TestConfig.requireLnAddress()
-        val balance = walletA.getBalance()
-        if (balance.totalSats < 50) {
-            println("WalletA needs >= 50 sats, skipping")
-            return@runBlocking
-        }
-
-        val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
-        val paymentID = walletA.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
-        assertTrue(paymentID.isNotEmpty())
-        println("External payment ID: $paymentID")
-    }
-
-    // =========================================================================
-    // Transfer Tests
-    // =========================================================================
-
-    @Test
-    fun claimPending() = runBlocking {
-        val claimed = walletA.claimAllPendingTransfers()
-        println("Claimed $claimed pending transfers")
-    }
-
-    @Test
-    fun sparkTransfer() = runBlocking {
-        val balanceA = walletA.getBalance()
-        if (balanceA.totalSats < 100) {
-            println("WalletA needs >= 100 sats (has ${balanceA.totalSats}), skipping")
-            return@runBlocking
-        }
-
-        val receiverPubKey = walletB.identityPublicKeyHex.hexToByteArray()
-        val transfer = walletA.send(
-            receiverIdentityPublicKey = receiverPubKey,
-            amountSats = 10,
-        )
-        assertTrue(transfer.id.isNotEmpty())
-        println("Transfer sent: ${transfer.id} status=${transfer.status}")
-
-        // Wait for propagation
-        kotlinx.coroutines.delay(3000)
-
-        val claimed = walletB.claimAllPendingTransfers()
-        assertTrue(claimed >= 1)
-
-        val balanceB = walletB.getBalance()
-        assertTrue(balanceB.totalSats >= 10)
-        println("WalletB balance: ${balanceB.totalSats} sats")
-    }
-
-    // =========================================================================
-    // Withdrawal Tests
-    // =========================================================================
-
-    @Test
-    fun roundTripTransfer() = runBlocking {
-        val balanceA = walletA.getBalance()
-        if (balanceA.totalSats < 50) {
-            println("WalletA needs >= 50 sats, skipping")
-            return@runBlocking
-        }
-
-        // Send A -> B
-        val sendAmount = 20L
-        val pubB = walletB.identityPublicKeyHex.hexToByteArray()
-        walletA.send(receiverIdentityPublicKey = pubB, amountSats = sendAmount)
-        kotlinx.coroutines.delay(3000)
-        walletB.claimAllPendingTransfers()
-
-        // Send all B -> A
-        val balB = walletB.getBalance()
-        assertTrue(balB.totalSats > 0)
-
-        val pubA = walletA.identityPublicKeyHex.hexToByteArray()
-        val transfer = walletB.send(
-            receiverIdentityPublicKey = pubA,
-            amountSats = balB.totalSats,
-        )
-        println("Return transfer: ${transfer.id}")
-
-        kotlinx.coroutines.delay(3000)
-        val claimed = walletA.claimAllPendingTransfers()
-        assertTrue(claimed >= 1)
-
-        // B should be empty
-        val finalB = walletB.getBalance()
-        assertEquals(0L, finalB.totalSats)
-        println("WalletB final balance: ${finalB.totalSats} sats")
-    }
-
-    // =========================================================================
-    // Withdrawal Tests
-    // =========================================================================
-
-    @Test
-    fun feeEstimate() = runBlocking {
-        val leaves = walletA.getLeaves()
-        if (leaves.isEmpty()) {
-            println("WalletA has no leaves, skipping")
-            return@runBlocking
-        }
-
-        val fee = walletA.getWithdrawalFeeEstimate(
-            onChainAddress = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-            leafIds = leaves.map { it.id },
-        )
-        assertTrue(fee.feeSats > 0)
-        println("Withdrawal fee estimate: ${fee.feeSats} sats")
-    }
-
-    // =========================================================================
-    // Settings Tests
-    // =========================================================================
-
-    @Test
-    fun privacyMode() = runBlocking {
-        val settings = walletA.getWalletSettings()
-        println("Privacy enabled: ${settings.privateEnabled}")
-
-        val updated = walletA.setPrivacyEnabled(true)
-        assertTrue(updated.privateEnabled)
-        println("Privacy toggled ON")
-
-        val check = walletA.getWalletSettings()
-        assertTrue(check.privateEnabled)
-
-        val restored = walletA.setPrivacyEnabled(false)
-        assertFalse(restored.privateEnabled)
-        println("Privacy toggled OFF")
-    }
-
-    // =========================================================================
-    // Transfer Query Tests
-    // =========================================================================
-
-    @Test
-    fun getTransfers() = runBlocking {
-        val transfers = walletA.getTransfers(limit = 10)
-        println("=== Recent Transfers (${transfers.size}) ===")
-        for (t in transfers) {
-            val dir = if (t.senderIdentityPublicKey == walletA.identityPublicKeyHex) "SENT" else "RECV"
-            println("  $dir | ${t.totalValueSats} sats | ${t.status} | ${t.type} | ${t.id}")
-        }
-        assertTrue(transfers.isNotEmpty())
-
-        val first = transfers[0]
-        val single = walletA.getTransfer(id = first.id)
-        assertEquals(single.id, first.id)
-        assertEquals(single.totalValueSats, first.totalValueSats)
-    }
-
-    // =========================================================================
-    // Debug / Info
-    // =========================================================================
-
-    @Test
-    fun showWalletInfo() = runBlocking {
-        val balA = walletA.getBalance()
-        val balB = walletB.getBalance()
-
-        println("=== Wallet A ===")
-        println("  Identity: ${walletA.identityPublicKeyHex}")
-        println("  Spark:    ${walletA.getSparkAddress()}")
-        println("  Balance:  ${balA.totalSats} sats (${balA.leaves.size} leaves)")
-
-        println("=== Wallet B ===")
-        println("  Identity: ${walletB.identityPublicKeyHex}")
-        println("  Spark:    ${walletB.getSparkAddress()}")
-        println("  Balance:  ${balB.totalSats} sats (${balB.leaves.size} leaves)")
-    }
-
-    // =========================================================================
-    // Funding Helpers
-    // =========================================================================
-
-    @Test
-    fun fundWalletA() = runBlocking {
-        val invoice = walletA.createLightningInvoice(amountSats = 2000, memo = "Fund walletA for tests")
-        println("\n=== PAY THIS INVOICE TO FUND WALLET A ===")
-        println(invoice.paymentRequest)
-        println("==========================================")
-        println("Amount: 2000 sats | Hash: ${invoice.paymentHash}")
-    }
-
-    @Test
-    fun withdrawToOnchain() = runBlocking {
-        val onchainAddress = "bc1qxaljgr87rlh6plxtjmxvkk9p45kk8dw743dg2s"
-
-        val balanceBefore = walletA.getBalance()
-        val spendable = balanceBefore.leaves.filter { it.isSpendable }
-        val spendableSats = spendable.sumOf { it.valueSats }
-        println("=== WalletA balance before ===")
-        println("  Total: ${balanceBefore.totalSats} sats (${balanceBefore.leaves.size} leaves)")
-        println("  Spendable: $spendableSats sats (${spendable.size} leaves)")
-        println("  Stuck/expired: ${balanceBefore.totalSats - spendableSats} sats")
-
-        if (spendableSats < 1000) {
-            println("Insufficient spendable balance for withdrawal test")
-            return@runBlocking
-        }
-
-        val feeEstimate = walletA.getWithdrawalFeeEstimate(
-            onChainAddress = onchainAddress,
-            leafIds = spendable.map { it.id },
-        )
-        println("Fee estimate: ${feeEstimate.feeSats} sats")
-        println("Would receive: ${spendableSats - feeEstimate.feeSats} sats on-chain")
-
-        val txid = walletA.withdraw(
-            onChainAddress = onchainAddress,
-            amountSats = spendableSats,
-        )
-        println("=== Withdrawal txid: $txid ===")
-        println("View at: https://mempool.space/tx/$txid")
-        assertTrue(txid.isNotEmpty())
-
-        kotlinx.coroutines.delay(3000)
-
-        val balanceAfter = walletA.getBalance()
-        println("WalletA balance after: ${balanceAfter.totalSats} sats")
-    }
-
-    @Test
-    fun fundWalletA5000() = runBlocking {
-        val invoice = walletA.createLightningInvoice(amountSats = 5000, memo = "Fund walletA for withdraw test")
-        println("\n=== PAY THIS INVOICE TO FUND WALLET A (5000 sats) ===")
-        println(invoice.paymentRequest)
-        println("=====================================================")
-        println("Amount: 5000 sats | Hash: ${invoice.paymentHash}")
-    }
-
-    @Test
-    fun claimWalletA() = runBlocking {
-        val claimed = walletA.claimAllPendingTransfers()
-        val balance = walletA.getBalance()
-        println("Claimed $claimed transfers. Balance: ${balance.totalSats} sats")
-    }
-
-    @Test
-    fun receivePayment() = runBlocking {
-        val balanceBefore = walletA.getBalance()
-        println("Balance before: ${balanceBefore.totalSats} sats")
-
-        val invoice = walletA.createLightningInvoice(amountSats = 100, memo = "pay me 100 sats")
-        println("\n=== PAY THIS INVOICE (100 sats) ===")
-        println(invoice.paymentRequest)
-        println("===================================")
-
-        // Poll for payment (up to 120 seconds)
-        println("Waiting for payment...")
-        var paid = false
-        for (i in 1..24) {
-            kotlinx.coroutines.delay(5000)
-            val claimed = walletA.claimAllPendingTransfers()
-            if (claimed > 0) {
-                println("Claimed $claimed transfers after ${i * 5}s!")
-                paid = true
-                break
-            }
-            print(".")
-        }
-
-        val balanceAfter = walletA.getBalance()
-        println("Balance after: ${balanceAfter.totalSats} sats")
-        if (paid) {
-            assertTrue(balanceAfter.totalSats > balanceBefore.totalSats)
-            println("Payment received! +${balanceAfter.totalSats - balanceBefore.totalSats} sats")
-        } else {
-            println("Timed out waiting for payment")
-        }
-    }
-
-    // =========================================================================
-    // Full Flow: Lightning A->B, Spark B->A, external lightning pay to TestConfig.lnAddress
-    // =========================================================================
-
-    @Test
-    fun testOnChainFeeEstimate() = runBlocking {
-        val address = "bc1qdxqntgy40ut7ep3mddds98t5undss7ka6l2dud"
-        val balance = walletA.getBalance()
-        println("Balance: ${balance.totalSats} sats")
-
-        val leaves = walletA.getLeaves()
-        println("Leaves: ${leaves.size}")
-        if (leaves.isEmpty()) {
-            println("No leaves — can't estimate fee")
-            return@runBlocking
-        }
-
-        val fee = walletA.getWithdrawalFeeEstimate(
-            onChainAddress = address,
-            leafIds = leaves.map { it.id },
-        )
-        println("On-chain fee estimate: ${fee.feeSats} sats")
-        assertTrue(fee.feeSats > 0)
-    }
-
-    // =========================================================================
-    // Full Flow
-    // =========================================================================
-
-    // =========================================================================
-    // Token Tests
-    // =========================================================================
-
-    @Test
-    fun queryTokenBalances() = runBlocking {
-        val balances = walletA.getTokenBalances()
-        println("Token balances: ${balances.size} tokens")
-        for (balance in balances) {
-            println("  ${balance.tokenMetadata.tokenName} (${balance.tokenMetadata.tokenTicker})")
-            println("    identifier: ${balance.tokenMetadata.tokenIdentifier}")
-            println("    owned: ${balance.ownedBalance}")
-            println("    available: ${balance.availableToSendBalance}")
-            println("    decimals: ${balance.tokenMetadata.decimals}")
-        }
-    }
-
-    @Test
-    fun queryTokenOutputs() = runBlocking {
-        val outputs = walletA.getTokenOutputs()
-        println("Token outputs: ${outputs.size}")
-        for (output in outputs.take(5)) {
-            val tokenId = output.tokenIdentifier.toHexString()
-            println("  amount=${output.tokenAmount} token=${tokenId.take(16)}... status=${output.status}")
-        }
-    }
-
-    @Test
-    fun queryTokenMetadataByIssuer() = runBlocking {
-        val metadatas = walletA.queryTokenMetadata(
-            issuerPublicKeys = listOf(walletA.signer.identityPublicKey)
-        )
-        println("Token metadata for issuer: ${metadatas.size} tokens")
-        for (meta in metadatas) {
-            println("  ${meta.tokenName} (${meta.tokenTicker})")
-            println("    identifier: ${meta.tokenIdentifier}")
-            println("    issuer: ${meta.issuerPublicKey.toHexString()}")
-            println("    freezable: ${meta.isFreezable}")
-        }
-    }
-
-    @Test
-    fun fullTokenLifecycle() = runBlocking {
-        // --- Phase 1: Create Token (or reuse existing) ---
-        println("\n--- Phase 1: Create Token ---")
-        val existingMetadatas = walletA.queryTokenMetadata(
-            issuerPublicKeys = listOf(walletA.signer.identityPublicKey)
-        )
-
-        val tokenIdentifier: String
-        if (existingMetadatas.isNotEmpty()) {
-            val existing = existingMetadatas[0]
-            tokenIdentifier = existing.tokenIdentifier
-            println("Reusing existing token: ${existing.tokenName} (${existing.tokenTicker})")
-            println("Token identifier: $tokenIdentifier")
-        } else {
-            val creation = walletA.createToken(
-                tokenName = "KotlinTest",
-                tokenTicker = "KTST",
-                decimals = 2u,
-                maxSupply = BigInteger.valueOf(1_000_000),
-                isFreezable = false,
+    fun shouldQueryBalance() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val balance = wallet.getBalance()
+            val sats = balance.satsBalance
+            println(
+                "Balance — available: ${sats.available}, owned: ${sats.owned}, incoming: ${sats.incoming}, " +
+                    "frozen: ${sats.frozen}, locked: ${sats.locked} sats, ${balance.leaves.size} leaves",
             )
-            assertTrue(creation.transactionHash.isNotEmpty())
-            println("Token created, tx: ${creation.transactionHash}")
-
-            kotlinx.coroutines.delay(5000)
-
-            val metadatas = walletA.queryTokenMetadata(
-                issuerPublicKeys = listOf(walletA.signer.identityPublicKey)
-            )
-            assertTrue("Token metadata not found after creation", metadatas.isNotEmpty())
-            tokenIdentifier = metadatas[0].tokenIdentifier
-            println("Token identifier: $tokenIdentifier")
-        }
-        assertTrue(tokenIdentifier.startsWith("btkn"))
-
-        // --- Phase 2: Mint Tokens ---
-        println("\n--- Phase 2: Mint 10000 tokens ---")
-        val mintAmount = BigInteger.valueOf(10_000)
-        val mintTx = walletA.mintTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = mintAmount,
-        )
-        assertTrue(mintTx.isNotEmpty())
-        println("Mint tx: $mintTx")
-
-        kotlinx.coroutines.delay(5000)
-
-        val balancesAfterMint = walletA.getTokenBalances()
-        val swftBalance = balancesAfterMint.firstOrNull { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        assertNotNull(swftBalance)
-        println("WalletA token balance after mint: ${swftBalance!!.ownedBalance}")
-        assertTrue(swftBalance.ownedBalance >= mintAmount)
-
-        // --- Phase 3: Transfer A -> B (5000 tokens) ---
-        println("\n--- Phase 3: Transfer 5000 tokens A -> B ---")
-        val transferAmount = BigInteger.valueOf(5_000)
-        val sparkAddressB = walletB.getSparkAddress()
-        val transferTx = walletA.transferTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = transferAmount,
-            receiverSparkAddress = sparkAddressB,
-        )
-        assertTrue(transferTx.isNotEmpty())
-        println("Transfer A->B tx: $transferTx")
-
-        kotlinx.coroutines.delay(5000)
-
-        val balancesB = walletB.getTokenBalances()
-        val balanceB = balancesB.firstOrNull { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletB token balance: ${balanceB?.ownedBalance ?: 0}")
-        assertNotNull(balanceB)
-        assertTrue(balanceB!!.ownedBalance >= transferAmount)
-
-        // --- Phase 4: Transfer B -> A (send it all back) ---
-        println("\n--- Phase 4: Transfer all tokens B -> A ---")
-        val sparkAddressA = walletA.getSparkAddress()
-        val returnTx = walletB.transferTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = transferAmount,
-            receiverSparkAddress = sparkAddressA,
-        )
-        assertTrue(returnTx.isNotEmpty())
-        println("Transfer B->A tx: $returnTx")
-
-        kotlinx.coroutines.delay(5000)
-
-        val finalBBalances = walletB.getTokenBalances()
-        val finalBToken = finalBBalances.firstOrNull { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletB final token balance: ${finalBToken?.ownedBalance ?: 0}")
-        assertTrue(finalBToken == null || finalBToken.ownedBalance == BigInteger.ZERO)
-
-        val finalABalances = walletA.getTokenBalances()
-        val finalAToken = finalABalances.firstOrNull { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletA final token balance: ${finalAToken?.ownedBalance ?: 0}")
-        assertNotNull(finalAToken)
-        assertTrue(finalAToken!!.ownedBalance >= mintAmount)
-
-        // --- Phase 5: Burn some tokens ---
-        println("\n--- Phase 5: Burn 1000 tokens ---")
-        val burnAmount = BigInteger.valueOf(1_000)
-        val burnTx = walletA.burnTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = burnAmount,
-        )
-        assertTrue(burnTx.isNotEmpty())
-        println("Burn tx: $burnTx")
-
-        kotlinx.coroutines.delay(5000)
-
-        val afterBurn = walletA.getTokenBalances()
-        val afterBurnToken = afterBurn.firstOrNull { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletA token balance after burn: ${afterBurnToken?.ownedBalance ?: 0}")
-
-        println("\nFull token lifecycle complete!")
-    }
-
-    // =========================================================================
-    // Static Deposit Tests
-    // =========================================================================
-
-    @Test
-    fun queryStaticDepositAddresses() = runBlocking {
-        val addresses = walletA.queryStaticDepositAddresses()
-        println("Static deposit addresses: ${addresses.size}")
-        for (addr in addresses) {
-            println("  ${addr.address}")
+            assertTrue(sats.available >= 0)
+            assertTrue(sats.owned >= sats.available)
         }
     }
 
     @Test
-    fun getUtxosForStaticDeposit() = runBlocking {
-        val staticAddr = walletA.getStaticDepositAddress()
-        val utxos = walletA.getUtxosForDepositAddress(address = staticAddr.address)
-        println("UTXOs at static address: ${utxos.size}")
-        for (utxo in utxos) {
-            println("  txid=${utxo.txid} vout=${utxo.vout}")
-        }
-    }
-
-    @Test
-    fun getUtxosForDepositAddress() = runBlocking {
-        val addresses = walletA.queryUnusedDepositAddresses()
-        if (addresses.isEmpty()) {
-            println("No unused deposit addresses, skipping")
-            return@runBlocking
-        }
-        val addr = addresses[0]
-        val utxos = walletA.getUtxosForDepositAddress(address = addr.address)
-        println("UTXOs at ${addr.address}: ${utxos.size}")
-        for (utxo in utxos) {
-            println("  txid=${utxo.txid} vout=${utxo.vout}")
-        }
-    }
-
-    // =========================================================================
-    // Idempotency Tests
-    // =========================================================================
-
-    @Test
-    fun lightningPaymentIdempotency() = runBlocking {
-        val balance = walletA.getBalance()
-        if (balance.totalSats < 100) {
-            println("WalletA needs >= 100 sats, skipping")
-            return@runBlocking
-        }
-
-        val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "idempotency test")
-        val idempotencyKey = "test-idem-ln-${java.util.UUID.randomUUID()}"
-
-        val paymentId = walletA.payLightningInvoice(
-            paymentRequest = invoice.paymentRequest,
-            maxFeeSats = 50,
-            idempotencyKey = idempotencyKey,
-        )
-        assertTrue(paymentId.isNotEmpty())
-        println("Lightning payment with idempotency key: $paymentId")
-
-        val balanceAfter = walletA.getBalance()
-        println("WalletA balance after: ${balanceAfter.totalSats} sats (was ${balance.totalSats})")
-        assertTrue(balanceAfter.totalSats < balance.totalSats)
-    }
-
-    @Test
-    fun tokenTransferIdempotency() = runBlocking {
-        val balancesBefore = walletA.getTokenBalances()
-        val tokenBal = balancesBefore.firstOrNull()
-        if (tokenBal == null || tokenBal.ownedBalance < BigInteger.valueOf(100)) {
-            println("No token with >= 100 balance, skipping")
-            return@runBlocking
-        }
-        val tokenIdentifier = tokenBal.tokenMetadata.tokenIdentifier
-        val balanceBefore = tokenBal.ownedBalance
-        println("WalletA token balance before: $balanceBefore")
-
-        val sparkAddressB = walletB.getSparkAddress()
-        val idempotencyKey = "test-idem-token-${java.util.UUID.randomUUID()}"
-        val transferAmount = BigInteger.valueOf(50)
-
-        val tx1 = walletA.transferTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = transferAmount,
-            receiverSparkAddress = sparkAddressB,
-            idempotencyKey = idempotencyKey,
-        )
-        assertTrue(tx1.isNotEmpty())
-        println("First transfer tx: $tx1")
-
-        kotlinx.coroutines.delay(3000)
-
-        val balancesAfterFirst = walletA.getTokenBalances()
-        val afterFirst = balancesAfterFirst.first { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletA token balance after transfer: ${afterFirst.ownedBalance}")
-        assertTrue(afterFirst.ownedBalance == balanceBefore - transferAmount)
-
-        // Send back from B to A to clean up
-        val sparkAddressA = walletA.getSparkAddress()
-        walletB.transferTokens(
-            tokenIdentifier = tokenIdentifier,
-            tokenAmount = transferAmount,
-            receiverSparkAddress = sparkAddressA,
-        )
-        kotlinx.coroutines.delay(3000)
-
-        val balancesFinal = walletA.getTokenBalances()
-        val finalBal = balancesFinal.first { it.tokenMetadata.tokenIdentifier == tokenIdentifier }
-        println("WalletA token balance after return: ${finalBal.ownedBalance}")
-        assertTrue(finalBal.ownedBalance == balanceBefore)
-        println("Token idempotency test passed!")
-    }
-
-    @Test
-    fun mintIdempotency() = runBlocking {
-        val metadatas = walletA.queryTokenMetadata(
-            issuerPublicKeys = listOf(walletA.signer.identityPublicKey)
-        )
-        if (metadatas.isEmpty()) {
-            println("No token found, skipping. Run fullTokenLifecycle first.")
-            return@runBlocking
-        }
-        val tokenMeta = metadatas[0]
-
-        val balanceBefore = walletA.getTokenBalances()
-        val ownedBefore = balanceBefore.first {
-            it.tokenMetadata.tokenIdentifier == tokenMeta.tokenIdentifier
-        }.ownedBalance
-        println("Token balance before mint: $ownedBefore")
-
-        val mintAmount = BigInteger.valueOf(100)
-        val tx = walletA.mintTokens(
-            tokenIdentifier = tokenMeta.tokenIdentifier,
-            tokenAmount = mintAmount,
-        )
-        assertTrue(tx.isNotEmpty())
-        println("Mint tx: $tx")
-
-        kotlinx.coroutines.delay(3000)
-
-        val balanceAfter = walletA.getTokenBalances()
-        val ownedAfter = balanceAfter.first {
-            it.tokenMetadata.tokenIdentifier == tokenMeta.tokenIdentifier
-        }.ownedBalance
-        println("Token balance after mint: $ownedAfter")
-        assertTrue(ownedAfter == ownedBefore + mintAmount)
-        println("Mint idempotency test passed!")
-    }
-
-    // =========================================================================
-    // Larger transfer stress test — verifies leaf selection on big amounts
-    // =========================================================================
-
-    @Test
-    fun largeTransferStress() = runBlocking {
-        val initialA = walletA.getBalance()
-        val initialB = walletB.getBalance()
-        val initialTotal = initialA.totalSats + initialB.totalSats
-        println("=== Initial state ===")
-        println("  WalletA: ${initialA.totalSats} sats (${initialA.leaves.size} leaves)")
-        println("  WalletB: ${initialB.totalSats} sats (${initialB.leaves.size} leaves)")
-        println("  TOTAL:   $initialTotal sats")
-
-        val sparkAmount = (initialA.totalSats / 2).coerceAtLeast(50)
-        if (initialA.totalSats < sparkAmount + 50) {
-            println("Not enough balance for stress test")
-            return@runBlocking
-        }
-
-        // --- Phase 1: Large Spark transfer A -> B ---
-        println("\n--- Phase 1: Spark A -> B ($sparkAmount sats) ---")
-        val pubB = walletB.identityPublicKeyHex.hexToByteArray()
-        val transferAB = walletA.send(receiverIdentityPublicKey = pubB, amountSats = sparkAmount)
-        assertTrue(transferAB.id.isNotEmpty())
-        println("  Transfer: ${transferAB.id}")
-
-        kotlinx.coroutines.delay(3000)
-        val claimedB1 = walletB.claimAllPendingTransfers()
-        assertTrue(claimedB1 >= 1)
-
-        val phase1A = walletA.getBalance()
-        val phase1B = walletB.getBalance()
-        val phase1Total = phase1A.totalSats + phase1B.totalSats
-        val phase1Loss = initialTotal - phase1Total
-        println("  WalletA: ${initialA.totalSats} -> ${phase1A.totalSats} (Δ ${phase1A.totalSats - initialA.totalSats})")
-        println("  WalletB: ${initialB.totalSats} -> ${phase1B.totalSats} (Δ +${phase1B.totalSats - initialB.totalSats})")
-        println("  System loss: $phase1Loss sats")
-
-        assertEquals(
-            "Large Spark transfer A->B must have ZERO loss",
-            0L,
-            phase1Loss,
-        )
-        assertEquals(
-            "WalletB should receive exactly $sparkAmount sats",
-            initialB.totalSats + sparkAmount,
-            phase1B.totalSats,
-        )
-
-        // --- Phase 2: Large Spark transfer B -> A (full balance) ---
-        println("\n--- Phase 2: Spark B -> A (${phase1B.totalSats} sats, full balance) ---")
-        val pubA = walletA.identityPublicKeyHex.hexToByteArray()
-        val transferBA = walletB.send(receiverIdentityPublicKey = pubA, amountSats = phase1B.totalSats)
-        assertTrue(transferBA.id.isNotEmpty())
-
-        kotlinx.coroutines.delay(3000)
-        val claimedA = walletA.claimAllPendingTransfers()
-        assertTrue(claimedA >= 1)
-
-        val phase2A = walletA.getBalance()
-        val phase2B = walletB.getBalance()
-        val phase2Total = phase2A.totalSats + phase2B.totalSats
-        val phase2Loss = phase1Total - phase2Total
-        println("  WalletA: ${phase1A.totalSats} -> ${phase2A.totalSats} (Δ +${phase2A.totalSats - phase1A.totalSats})")
-        println("  WalletB: ${phase1B.totalSats} -> ${phase2B.totalSats}")
-        println("  System loss: $phase2Loss sats")
-
-        assertEquals("Spark transfer B->A must have ZERO loss", 0L, phase2Loss)
-        assertEquals("WalletB must be empty", 0L, phase2B.totalSats)
-
-        // --- Phase 3: Partial Spark transfer A -> B (an "odd" amount that requires swap) ---
-        // Use an amount unlikely to match power-of-2 leaf denominations
-        val oddAmount = 137L
-        println("\n--- Phase 3: Spark A -> B ($oddAmount sats, odd amount likely needs swap) ---")
-        val transferOdd = walletA.send(receiverIdentityPublicKey = pubB, amountSats = oddAmount)
-        assertTrue(transferOdd.id.isNotEmpty())
-
-        kotlinx.coroutines.delay(3000)
-        val claimedB2 = walletB.claimAllPendingTransfers()
-        assertTrue(claimedB2 >= 1)
-
-        val phase3A = walletA.getBalance()
-        val phase3B = walletB.getBalance()
-        val phase3Total = phase3A.totalSats + phase3B.totalSats
-        val phase3Loss = phase2Total - phase3Total
-        println("  WalletA: ${phase2A.totalSats} -> ${phase3A.totalSats} (Δ ${phase3A.totalSats - phase2A.totalSats})")
-        println("  WalletB: ${phase2B.totalSats} -> ${phase3B.totalSats} (Δ +${phase3B.totalSats - phase2B.totalSats})")
-        println("  System loss: $phase3Loss sats")
-
-        assertEquals("Odd-amount Spark transfer must have ZERO loss", 0L, phase3Loss)
-        assertEquals(
-            "WalletB should receive exactly $oddAmount sats",
-            oddAmount,
-            phase3B.totalSats,
-        )
-
-        // --- Phase 4: Send it all back B -> A ---
-        println("\n--- Phase 4: Spark B -> A ($oddAmount sats back) ---")
-        walletB.send(receiverIdentityPublicKey = pubA, amountSats = phase3B.totalSats)
-        kotlinx.coroutines.delay(3000)
-        walletA.claimAllPendingTransfers()
-
-        val finalA = walletA.getBalance()
-        val finalB = walletB.getBalance()
-        val finalTotal = finalA.totalSats + finalB.totalSats
-        val totalLoss = initialTotal - finalTotal
-
-        println("\n=== Final accounting ===")
-        println("  Initial: $initialTotal sats (A=${initialA.totalSats}, B=${initialB.totalSats})")
-        println("  Final:   $finalTotal sats (A=${finalA.totalSats}, B=${finalB.totalSats})")
-        println("  Total loss across all 4 Spark transfers: $totalLoss sats")
-
-        assertEquals(
-            "All-Spark stress test must have ZERO total loss (no LN involved)",
-            0L,
-            totalLoss,
-        )
-        assertEquals("WalletB must be empty at end", 0L, finalB.totalSats)
-        println("Large transfer stress test passed — zero leaf loss across 4 large transfers!")
-    }
-
-    // =========================================================================
-    // Full Flow
-    // =========================================================================
-
-    @Test
-    fun fullRoundTrip() = runBlocking {
-        val initialA = walletA.getBalance()
-        val initialB = walletB.getBalance()
-        val initialTotal = initialA.totalSats + initialB.totalSats
-        println("=== Initial state ===")
-        println("  WalletA: ${initialA.totalSats} sats (${initialA.leaves.size} leaves)")
-        println("  WalletB: ${initialB.totalSats} sats (${initialB.leaves.size} leaves)")
-        println("  TOTAL:   $initialTotal sats")
-
-        if (initialA.totalSats < MINIMUM_TEST_BALANCE) {
-            val deposit = walletA.getDepositAddress()
-            println("WalletA needs >= $MINIMUM_TEST_BALANCE sats. Deposit to: ${deposit.address}")
-            fail("Insufficient funds")
-        }
-
-        // --- Phase 1: Lightning A -> B (100 sats) ---
-        // Lightning has fees, so the system total decreases by the lightning fee.
-        println("\n--- Phase 1: Lightning A -> B (100 sats) ---")
-        val lnAmount = 100L
-        val lnFeeEstimate = walletA.getLightningSendFeeEstimate(
-            encodedInvoice = walletB.createLightningInvoice(amountSats = lnAmount).paymentRequest
-        )
-        println("  Estimated LN fee: $lnFeeEstimate sats")
-
-        val invoice = walletB.createLightningInvoice(amountSats = lnAmount, memo = "full flow test")
-        assertEquals(lnAmount, invoice.amountSats)
-
-        val payID = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
-        assertTrue(payID.isNotEmpty())
-        println("  Payment sent: $payID")
-
-        kotlinx.coroutines.delay(5000)
-        val claimedB = walletB.claimAllPendingTransfers()
-        println("  WalletB claimed $claimedB transfers")
-
-        val afterPhase1A = walletA.getBalance()
-        val afterPhase1B = walletB.getBalance()
-        val afterPhase1Total = afterPhase1A.totalSats + afterPhase1B.totalSats
-        val phase1Loss = initialTotal - afterPhase1Total
-        println("  WalletA: ${initialA.totalSats} -> ${afterPhase1A.totalSats} (Δ ${afterPhase1A.totalSats - initialA.totalSats})")
-        println("  WalletB: ${initialB.totalSats} -> ${afterPhase1B.totalSats} (Δ +${afterPhase1B.totalSats - initialB.totalSats})")
-        println("  System loss (LN fee): $phase1Loss sats")
-
-        // WalletB should have received exactly lnAmount more
-        assertEquals(
-            "WalletB should receive exactly $lnAmount sats",
-            initialB.totalSats + lnAmount,
-            afterPhase1B.totalSats,
-        )
-        // WalletA should have lost exactly (lnAmount + actual_fee)
-        // Loss should match the LN fee — sanity check it's not insanely large
-        assertTrue(
-            "Phase 1 loss ($phase1Loss) should be small (just LN fee), not loss of leaves",
-            phase1Loss in 0..(lnAmount * 2),
-        )
-
-        // --- Phase 2: Spark Transfer B -> A (full balance, no fee) ---
-        // Spark transfers have NO fee, so the system total must be unchanged.
-        println("\n--- Phase 2: Spark B -> A (${afterPhase1B.totalSats} sats) ---")
-        val pubA = walletA.identityPublicKeyHex.hexToByteArray()
-        val transfer = walletB.send(
-            receiverIdentityPublicKey = pubA,
-            amountSats = afterPhase1B.totalSats,
-        )
-        assertTrue(transfer.id.isNotEmpty())
-        println("  Transfer: ${transfer.id}")
-
-        kotlinx.coroutines.delay(3000)
-        val claimedA = walletA.claimAllPendingTransfers()
-        assertTrue(claimedA >= 1)
-
-        val afterPhase2A = walletA.getBalance()
-        val afterPhase2B = walletB.getBalance()
-        val afterPhase2Total = afterPhase2A.totalSats + afterPhase2B.totalSats
-        val phase2Loss = afterPhase1Total - afterPhase2Total
-        println("  WalletA: ${afterPhase1A.totalSats} -> ${afterPhase2A.totalSats} (Δ +${afterPhase2A.totalSats - afterPhase1A.totalSats})")
-        println("  WalletB: ${afterPhase1B.totalSats} -> ${afterPhase2B.totalSats} (Δ ${afterPhase2B.totalSats - afterPhase1B.totalSats})")
-        println("  System loss: $phase2Loss sats")
-
-        // Spark transfers MUST have zero loss — this is the leaf selection bug check
-        assertEquals(
-            "Spark transfer must have ZERO loss (leaf selection bug check)",
-            0L,
-            phase2Loss,
-        )
-        // WalletB must be fully drained
-        assertEquals("WalletB must be empty after sending all balance", 0L, afterPhase2B.totalSats)
-        // WalletA must have grown by exactly afterPhase1B.totalSats
-        assertEquals(
-            "WalletA must receive exactly the sent amount",
-            afterPhase1A.totalSats + afterPhase1B.totalSats,
-            afterPhase2A.totalSats,
-        )
-
-        // --- Phase 3: External Lightning A -> ${TestConfig.lnAddress} (10 sats) ---
-        TestConfig.requireLnAddress()
-        println("\n--- Phase 3: Lightning A -> ${TestConfig.lnAddress} (10 sats) ---")
-        val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
-        val extPayID = walletA.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
-        assertTrue(extPayID.isNotEmpty())
-        println("  External payment: $extPayID")
-
-        val finalA = walletA.getBalance()
-        val finalB = walletB.getBalance()
-        val finalTotal = finalA.totalSats + finalB.totalSats
-        val phase3Loss = afterPhase2Total - finalTotal
-        println("  WalletA: ${afterPhase2A.totalSats} -> ${finalA.totalSats} (Δ ${finalA.totalSats - afterPhase2A.totalSats})")
-        println("  Phase 3 loss (10 sats + LN fee): $phase3Loss sats")
-
-        // Phase 3 sends 10 sats externally, so loss should be ~10 + fee
-        assertTrue(
-            "Phase 3 loss ($phase3Loss) should be small (10 sats + LN fee)",
-            phase3Loss in 10..200,
-        )
-
-        // --- Final accounting ---
-        val totalLoss = initialTotal - finalTotal
-        println("\n=== Final accounting ===")
-        println("  Initial:    $initialTotal sats")
-        println("  Final:      $finalTotal sats")
-        println("  Total loss: $totalLoss sats (LN fees + 10 sats sent externally)")
-        println("  WalletA: ${initialA.totalSats} -> ${finalA.totalSats}")
-        println("  WalletB: ${initialB.totalSats} -> ${finalB.totalSats}")
-
-        // Total loss should be: 10 sats sent externally + 2 LN fees
-        // Sanity check: should never lose more than ~300 sats total
-        assertTrue(
-            "Total loss ($totalLoss) is too high — possible leaf selection bug",
-            totalLoss in 10..300,
-        )
-        println("Full flow complete — no leaves lost!")
-    }
-
-    // =========================================================================
-    // Recovery / Consolidation / Renewal Tests
-    // =========================================================================
-
-    @Test
-    fun recoverySnapshot() = runBlocking {
-        val snapshot = walletA.getRecoverySnapshot()
-        val balance = walletA.getBalance()
-
-        assertEquals("MAINNET", snapshot.network)
-        assertEquals(walletA.identityPublicKeyHex, snapshot.identityPublicKeyHex)
-        // Snapshot covers owned statuses beyond AVAILABLE, so it is >= available.
-        assertTrue(
-            "snapshot ${snapshot.totalLeafSats} < available ${balance.satsBalance.available}",
-            snapshot.totalLeafSats >= balance.satsBalance.available,
-        )
-
-        val byId = mutableMapOf<String, spark.Spark.TreeNode>()
-        for (leaf in snapshot.leaves) {
-            val node = spark.Spark.TreeNode.parseFrom(leaf.treeNodeHex.hexToByteArray())
-            assertEquals(leaf.id, node.id)
-            assertTrue("leaf ${leaf.id} missing node tx", !node.nodeTx.isEmpty)
-            assertTrue("leaf ${leaf.id} missing refund tx", !node.refundTx.isEmpty)
-            byId[node.id] = node
-        }
-        for (ancestor in snapshot.nodes) {
-            val node = spark.Spark.TreeNode.parseFrom(ancestor.treeNodeHex.hexToByteArray())
-            assertEquals(ancestor.id, node.id)
-            assertTrue("ancestor ${ancestor.id} missing node tx", !node.nodeTx.isEmpty)
-            byId[node.id] = node
-        }
-
-        // Every leaf's chain must terminate at a root inside the bundle.
-        for (leaf in snapshot.leaves) {
-            var cursor = byId.getValue(leaf.id)
-            var hops = 0
-            while (cursor.hasParentNodeId() && cursor.parentNodeId.isNotEmpty()) {
-                assertTrue("cycle or over-long chain above ${leaf.id}", hops < 100)
-                cursor = byId[cursor.parentNodeId]
-                    ?: throw AssertionError("hole above leaf ${leaf.id}: ${cursor.parentNodeId}")
-                hops++
+    fun shouldQueryLeaves() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            for (leaf in wallet.getLeaves()) {
+                println("  Leaf ${leaf.id}: ${leaf.valueSats} sats [${leaf.status}]")
+                assertTrue(leaf.valueSats > 0)
+                assertEquals("AVAILABLE", leaf.status)
             }
         }
-        println(
-            "Recovery snapshot — ${snapshot.leaves.size} leaves, ${snapshot.nodes.size} ancestors, " +
-                "${snapshot.totalLeafSats} sats",
-        )
+    }
+}
+
+// =============================================================================
+// Recovery Snapshot Tests (unilateral-exit bundle material)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class RecoveryTests : LiveSuite() {
+    @Test
+    fun theRecoverySnapshotCoversTheBalanceWithCompleteAncestorChains() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val balance = wallet.getBalance()
+            val snapshot = wallet.getRecoverySnapshot()
+            println("Snapshot: ${snapshot.leaves.size} leaves (${snapshot.totalLeafSats} sats), ${snapshot.nodes.size} ancestor nodes")
+
+            assertEquals("MAINNET", snapshot.network)
+            assertEquals(wallet.identityPublicKeyHex, snapshot.identityPublicKeyHex)
+            // Every available sat must be covered by the snapshot's leaves.
+            assertTrue(snapshot.totalLeafSats >= balance.satsBalance.available)
+
+            // Decode every entry and verify each leaf chain walks to a root.
+            val byId = mutableMapOf<String, Spark.TreeNode>()
+            for (entry in snapshot.leaves) {
+                val node = Spark.TreeNode.parseFrom(entry.treeNodeHex.hexToByteArray())
+                assertEquals(entry.id, node.id)
+                assertFalse("leaf ${entry.id} missing refund tx", node.refundTx.isEmpty)
+                assertFalse("leaf ${entry.id} missing node tx", node.nodeTx.isEmpty)
+                byId[entry.id] = node
+            }
+            for (entry in snapshot.nodes) {
+                byId[entry.id] = Spark.TreeNode.parseFrom(entry.treeNodeHex.hexToByteArray())
+            }
+            for (leaf in snapshot.leaves) {
+                var cursor = byId.getValue(leaf.id)
+                var hops = 0
+                while (cursor.hasParentNodeId() && cursor.parentNodeId.isNotEmpty()) {
+                    cursor = byId[cursor.parentNodeId] ?: throw AssertionError("broken chain above leaf ${leaf.id}")
+                    hops++
+                    assertTrue("chain too deep — cycle?", hops < 100)
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Consolidation Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class ConsolidationTests : LiveSuite() {
+    @Test(timeout = 5 * MINUTE)
+    fun consolidationReducesTheLeafCountWithoutLosingSats() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val before = wallet.getLeaves()
+            val result = wallet.consolidateLeaves()
+            println(
+                "Consolidation: ${result.leavesBefore} -> ${result.leavesAfter} leaves in ${result.rounds} round(s), " +
+                    "fee ${result.feeSats} sats, skipped ${result.skippedLeaves}",
+            )
+            assertEquals(before.size, result.leavesBefore)
+            assertTrue(result.leavesAfter <= result.leavesBefore)
+            assertEquals("SSP swap unexpectedly charged ${result.feeSats} sats", 0L, result.feeSats)
+            // Already-minimal wallets are a no-op; fragmented ones must shrink.
+            val ideal = binaryDecomposition(result.totalSatsBefore).size
+            assertTrue(result.leavesAfter <= maxOf(ideal, result.leavesBefore))
+        }
+    }
+}
+
+// =============================================================================
+// Deposit Tests (matching JS: deposit.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class DepositTests : LiveSuite() {
+    @Test
+    fun shouldGenerateASingleUseDepositAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val deposit = wallet.getDepositAddress()
+            assertTrue(deposit.address.isNotEmpty())
+            assertTrue(deposit.leafId.isNotEmpty())
+            assertTrue(deposit.address.startsWith("bc1p")) // P2TR address
+            println("Deposit address: ${deposit.address}")
+        }
     }
 
     @Test
-    fun consolidateLeaves() = runBlocking {
-        val before = walletA.getLeaves()
-        val result = walletA.consolidateLeaves()
-
-        println(
-            "Consolidation — leaves ${result.leavesBefore} -> ${result.leavesAfter}, " +
-                "sats ${result.totalSatsBefore} -> ${result.totalSatsAfter}, " +
-                "fee ${result.feeSats}, rounds ${result.rounds}, skipped ${result.skippedLeaves}",
-        )
-        assertEquals(before.size, result.leavesBefore)
-        assertTrue(result.leavesAfter <= result.leavesBefore)
-        // SSP swaps are requested with fee_sats 0 — consolidation must be free.
-        assertEquals(0L, result.feeSats)
-        val ideal = binaryDecomposition(result.totalSatsAfter).size
-        assertTrue(
-            "leavesAfter ${result.leavesAfter} above max(ideal=$ideal, before=${result.leavesBefore})",
-            result.leavesAfter <= maxOf(ideal, result.leavesBefore),
-        )
+    fun shouldGenerateAStaticDepositAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val deposit = wallet.getStaticDepositAddress()
+            assertTrue(deposit.address.isNotEmpty())
+            assertTrue(deposit.address.startsWith("bc1p"))
+            println("Static deposit address: ${deposit.address}")
+        }
     }
 
     @Test
-    fun renewExhaustedLeavesSmoke() = runBlocking {
-        val leaves = walletA.getLeaves()
-        val result = walletA.renewExhaustedLeaves()
+    fun theStaticDepositAddressIsDeterministic() = liveTest {
+        val first = withWallet(WALLET_A_MNEMONIC) { it.getStaticDepositAddress() }
+        val second = withWallet(WALLET_A_MNEMONIC) { it.getStaticDepositAddress() }
+        assertEquals(first.address, second.address)
+    }
 
-        println(
-            "Renewal — checked ${result.checked}, renewed ${result.renewed}, " +
-                "failures ${result.failures.size}${if (result.failures.isEmpty()) "" else ": ${result.failures}"}",
-        )
-        assertEquals(leaves.size, result.checked)
-        assertTrue("renewal sweep reported failures: ${result.failures}", result.failures.isEmpty())
+    @Test
+    fun shouldQueryUnusedDepositAddresses() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val addresses = wallet.queryUnusedDepositAddresses()
+            println("Unused deposit addresses: ${addresses.size}")
+            for (address in addresses) {
+                assertTrue(address.address.isNotEmpty())
+                assertTrue(address.leafId.isNotEmpty())
+                println("  ${address.address} leafId=${address.leafId}")
+            }
+        }
+    }
 
-        // After a sweep every leaf must sit above the renewal-needed threshold.
-        for (leaf in walletA.getLeaves()) {
+    @Test
+    fun shouldGenerateMultipleDepositAddressesAndQueryThem() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            // Every page: the test wallet accumulates unused addresses across runs, well past one page.
+            suspend fun unusedCount(): Int {
+                var count = 0
+                var offset = 0
+                while (true) {
+                    val page = wallet.queryUnusedDepositAddresses(limit = 100, offset = offset)
+                    count += page.size
+                    if (page.size < 100) return count
+                    offset += page.size
+                }
+            }
+            val countBefore = unusedCount()
+            wallet.getDepositAddress()
+            wallet.getDepositAddress()
+            val countAfter = unusedCount()
+            assertTrue("$countBefore -> $countAfter", countAfter >= countBefore + 2)
+        }
+    }
+
+    @Test
+    fun aGeneratedDepositAddressAppearsInTheUnusedDepositAddresses() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val deposit = wallet.getDepositAddress()
+            val unused = wallet.queryUnusedDepositAddresses()
             assertTrue(
-                "leaf ${leaf.id} still below renewal threshold (tl ${leaf.refundTimelockBlocks})",
-                leaf.refundTimelockBlocks >= 200u,
+                "Generated deposit address should appear in unused list",
+                unused.any { it.leafId == deposit.leafId && it.address == deposit.address },
             )
+            println("Confirmed deposit ${deposit.address} (leafId=${deposit.leafId}) is in unused list")
+        }
+    }
+
+    @Test
+    fun staticDepositAddressesDoNotAppearInTheUnusedDepositAddresses() = liveTest {
+        // Static deposits use a different query endpoint.
+        withWallet(WALLET_B_MNEMONIC) { wallet ->
+            val staticAddress = wallet.getStaticDepositAddress()
+            assertFalse(wallet.queryUnusedDepositAddresses().any { it.address == staticAddress.address })
+        }
+    }
+
+    @Test
+    fun shouldQueryStaticDepositAddresses() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            // Ensure at least one static address exists.
+            val generated = wallet.getStaticDepositAddress()
+            val addresses = wallet.queryStaticDepositAddresses()
+            assertTrue(addresses.isNotEmpty())
+            assertTrue(addresses.any { it.address == generated.address })
+            println("Static deposit addresses: ${addresses.size}")
+            for (address in addresses) {
+                assertTrue(address.address.startsWith("bc1p"))
+                println("  ${address.address}")
+            }
+        }
+    }
+
+    @Test
+    fun queryStaticDepositAddressesReturnsDeterministicResults() = liveTest {
+        val first = withWallet(WALLET_A_MNEMONIC) { it.queryStaticDepositAddresses() }
+        val second = withWallet(WALLET_A_MNEMONIC) { it.queryStaticDepositAddresses() }
+        assertEquals(first.map { it.address }, second.map { it.address })
+    }
+
+    @Test
+    fun shouldGetUtxosForADepositAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            // A fresh single-use address: no deposits sent, so no UTXOs.
+            val deposit = wallet.getDepositAddress()
+            val utxos = wallet.getUtxosForDepositAddress(address = deposit.address)
+            println("UTXOs for ${deposit.address}: ${utxos.size}")
+            assertTrue("Fresh deposit address should have no UTXOs", utxos.isEmpty())
+        }
+    }
+
+    @Test
+    fun shouldGetUtxosForAStaticDepositAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val staticAddress = wallet.getStaticDepositAddress()
+            val utxos = wallet.getUtxosForDepositAddress(address = staticAddress.address)
+            println("UTXOs for static address ${staticAddress.address}: ${utxos.size}")
+            for (utxo in utxos) {
+                assertTrue(utxo.txid.isNotEmpty())
+                println("  txid=${utxo.txid} vout=${utxo.vout}")
+            }
+        }
+    }
+
+    @Test
+    fun claimStaticDepositWithMaxFeeRefusesAnUnknownTxid() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            // A fake txid: neither its transaction nor a quote can be fetched.
+            expectSparkError {
+                wallet.claimStaticDepositWithMaxFee(transactionId = "0".repeat(64), maxFee = 1000)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Lightning Tests (matching JS: lightning.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class LightningTests : LiveSuite() {
+    @Test
+    fun shouldCreateALightningInvoice() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val invoice = wallet.createLightningInvoice(amountSats = 100, memo = "test invoice")
+            assertTrue(invoice.paymentRequest.isNotEmpty())
+            assertTrue(invoice.paymentHash.isNotEmpty())
+            assertEquals(100L, invoice.amountSats)
+            assertTrue(invoice.expiresAt.after(Date()))
+            assertTrue(invoice.paymentRequest.lowercase().startsWith("lnbc"))
+            println("Invoice: ${invoice.paymentRequest.take(50)}...")
+        }
+    }
+
+    @Test
+    fun shouldCreateAnInvoiceWithoutMemo() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            assertTrue(wallet.createLightningInvoice(amountSats = 50).paymentRequest.isNotEmpty())
+        }
+    }
+
+    @Test
+    fun shouldGetALightningSendFeeEstimate() = liveTest {
+        withWallets { walletA, walletB ->
+            val invoice = walletB.createLightningInvoice(amountSats = 100)
+            val fee = walletA.getLightningSendFeeEstimate(encodedInvoice = invoice.paymentRequest)
+            assertTrue(fee >= 0)
+            println("Fee estimate: $fee sats")
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun shouldPayALightningInvoiceBetweenWallets() = liveTest {
+        withWallets { walletA, walletB ->
+            val before = walletA.getBalance().satsBalance.available
+            needsSats("WalletA", before, 100)
+            val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "integration test")
+            val paymentId = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
+            assertTrue(paymentId.isNotEmpty())
+            println("Payment ID: $paymentId")
+            // The sender's balance decreased.
+            val after = walletA.getBalance().satsBalance.available
+            assertTrue(after < before)
+            println("WalletA: $before -> $after sats")
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun shouldPayAnExternalLightningAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            needsSats("WalletA", wallet.getBalance().satsBalance.available, 50)
+            TestConfig.requireLnAddress()
+            val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
+            val paymentId = wallet.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
+            assertTrue(paymentId.isNotEmpty())
+            println("External payment ID: $paymentId")
+        }
+    }
+}
+
+// =============================================================================
+// Transfer Tests (matching JS: transfer.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class TransferTests : LiveSuite() {
+    @Test
+    fun shouldClaimPendingTransfers() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            println("Claimed ${wallet.claimAllPendingTransfers()} pending transfers")
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun shouldTransferBetweenWalletsViaSpark() = liveTest {
+        withWallets { walletA, walletB ->
+            needsSats("WalletA", walletA.getBalance().satsBalance.available, 100)
+            val amount = 10L
+            val transfer = walletA.send(receiverIdentityPublicKey = walletB.identityPublicKeyHex.hexToByteArray(), amountSats = amount)
+            assertTrue(transfer.id.isNotEmpty())
+            println("Transfer sent: ${transfer.id} status=${transfer.status}")
+            delay(3_000)
+            assertTrue(walletB.claimAllPendingTransfers() >= 1)
+            val balanceB = walletB.getBalance().satsBalance.available
+            assertTrue(balanceB >= amount)
+            println("WalletB balance: $balanceB sats")
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun shouldTransferAllTheBalanceAndReturnIt() = liveTest {
+        withWallets { walletA, walletB ->
+            // Ensure B has a balance (send A -> B first).
+            needsSats("WalletA", walletA.getBalance().satsBalance.available, 50)
+            walletA.send(receiverIdentityPublicKey = walletB.identityPublicKeyHex.hexToByteArray(), amountSats = 20)
+            delay(3_000)
+            walletB.claimAllPendingTransfers()
+
+            // Now send all B -> A.
+            val balanceB = walletB.getBalance().satsBalance.available
+            assertTrue(balanceB > 0)
+            val transfer = walletB.send(receiverIdentityPublicKey = walletA.identityPublicKeyHex.hexToByteArray(), amountSats = balanceB)
+            println("Return transfer: ${transfer.id}")
+            delay(3_000)
+            assertTrue(walletA.claimAllPendingTransfers() >= 1)
+
+            // B's spendable balance is empty now.
+            val finalB = walletB.getBalance().satsBalance.available
+            assertEquals(0L, finalB)
+            println("WalletB final balance: $finalB sats")
+        }
+    }
+
+    /** Kotlin-only: large and odd-amount transfers lose no sat. */
+    @Test(timeout = 10 * MINUTE)
+    fun largeTransfersLoseNoSat() = liveTest {
+        withWallets { walletA, walletB ->
+            fun owned(balance: WalletBalance) = balance.satsBalance.owned + balance.satsBalance.incoming
+            walletB.claimPendingTransfers()
+            val initialA = walletA.getBalance()
+            val initialB = walletB.getBalance()
+            val initialTotal = owned(initialA) + owned(initialB)
+            val available = initialA.satsBalance.available
+            val sparkAmount = (available / 2).coerceAtLeast(50)
+            needsSats("WalletA", available, sparkAmount + 150)
+
+            // Phase 1: a large Spark transfer A -> B.
+            val pubB = walletB.identityPublicKeyHex.hexToByteArray()
+            assertTrue(walletA.send(receiverIdentityPublicKey = pubB, amountSats = sparkAmount).id.isNotEmpty())
+            delay(3_000)
+            assertTrue(walletB.claimAllPendingTransfers() >= 1)
+            val phase1B = walletB.getBalance()
+            assertEquals("no sat lost A -> B", initialTotal, owned(walletA.getBalance()) + owned(phase1B))
+            assertEquals(owned(initialB) + sparkAmount, owned(phase1B))
+
+            // Phase 2: an odd amount, likely needing a swap, A -> B.
+            val oddAmount = 137L
+            assertTrue(walletA.send(receiverIdentityPublicKey = pubB, amountSats = oddAmount).id.isNotEmpty())
+            delay(3_000)
+            assertTrue(walletB.claimAllPendingTransfers() >= 1)
+            assertEquals("no sat lost on the odd amount", initialTotal, owned(walletA.getBalance()) + owned(walletB.getBalance()))
+
+            // Phase 3: everything B received back to A.
+            val back = walletB.getBalance().satsBalance.available
+            walletB.send(receiverIdentityPublicKey = walletA.identityPublicKeyHex.hexToByteArray(), amountSats = back)
+            delay(3_000)
+            walletA.claimAllPendingTransfers()
+            val finalTotal = owned(walletA.getBalance()) + owned(walletB.getBalance())
+            println("Initial $initialTotal sats, final $finalTotal sats")
+            assertEquals("no sat lost across the Spark transfers", initialTotal, finalTotal)
+        }
+    }
+}
+
+// =============================================================================
+// Cooperative Exit (Withdrawal) Tests (matching JS: coop-exit.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class WithdrawalTests : LiveSuite() {
+    @Test
+    fun shouldGetAWithdrawalFeeEstimate() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val leaves = wallet.getLeaves()
+            assumeTrue("WalletA has no leaves", leaves.isNotEmpty())
+            val fee = wallet.getWithdrawalFeeEstimate(onChainAddress = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", leafIds = leaves.map { it.id })
+            assertTrue(fee.feeSats > 0)
+            println("Withdrawal fee estimate: ${fee.feeSats} sats")
+        }
+    }
+
+    // The actual withdrawal is destructive (spends the whole balance): run it by hand only.
+    @Ignore("Destructive: spends balance")
+    @Test(timeout = 10 * MINUTE)
+    fun shouldWithdrawToAnOnChainAddress() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val available = wallet.getBalance().satsBalance.available
+            assumeTrue("No balance to withdraw", available > 0)
+            val txid = wallet.withdraw(onChainAddress = "bc1qhta0uu4a7yt0jp3vmzasl3srelx9v46ncl9x89", amountSats = available)
+            assertTrue(txid.isNotEmpty())
+            println("Withdrawal txid: $txid")
+        }
+    }
+}
+
+// =============================================================================
+// Static Deposit Tests (matching JS: static_deposit.test.ts)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class StaticDepositTests : LiveSuite() {
+    private fun requireStaticDepositWallet(): String {
+        val mnemonic = TestConfig.staticDepositMnemonic
+        assumeTrue("SPARK_TEST_STATIC_DEPOSIT_MNEMONIC is not set", mnemonic != null)
+        return mnemonic!!
+    }
+
+    @Test
+    fun shouldGetUtxosForAStaticDepositAddressClaimedOnesIncluded() = liveTest {
+        val mnemonic = requireStaticDepositWallet()
+        val targetAddress = TestConfig.staticDepositAddress
+        assumeTrue("SPARK_TEST_STATIC_DEPOSIT_ADDRESS is not set", targetAddress != null)
+        withWallet(mnemonic, account = TestConfig.staticDepositAccount) { wallet ->
+            // The fixture address has received deposits; once they are claimed only the query that
+            // includes claimed ones still lists them.
+            val utxos = wallet.getUtxosForDepositAddress(address = targetAddress!!, excludeClaimed = false)
+            val unclaimed = wallet.getUtxosForDepositAddress(address = targetAddress)
+            println("UTXOs at $targetAddress: ${utxos.size}, ${unclaimed.size} unclaimed")
+            for (utxo in utxos) println("  txid=${utxo.txid} vout=${utxo.vout}")
+            assertTrue("Expected at least one UTXO", utxos.isNotEmpty())
+            assertTrue(unclaimed.all { candidate -> utxos.any { it.txid == candidate.txid && it.vout == candidate.vout } })
+        }
+    }
+
+    @Test
+    fun shouldEstimateTheWithdrawalFeeForTheWholeBalance() = liveTest {
+        val mnemonic = requireStaticDepositWallet()
+        val withdrawAddress = TestConfig.staticDepositWithdrawAddress
+        assumeTrue("SPARK_TEST_STATIC_DEPOSIT_WITHDRAW_ADDRESS is not set", withdrawAddress != null)
+        withWallet(mnemonic, account = TestConfig.staticDepositAccount) { wallet ->
+            val balance = wallet.getBalance()
+            println("Balance: ${balance.satsBalance.available} sats, leaves: ${balance.leaves.size}")
+            for (leaf in balance.leaves) println("  leaf ${leaf.id}: ${leaf.valueSats} sats [${leaf.status}]")
+            if (balance.leaves.isEmpty()) {
+                println("No leaves to estimate withdrawal for")
+                return@withWallet
+            }
+            val fee = wallet.getWithdrawalFeeEstimate(onChainAddress = withdrawAddress!!, leafIds = balance.leaves.map { it.id })
+            println("Withdrawal fee estimate: ${fee.feeSats} sats; would receive ${balance.satsBalance.available - fee.feeSats} sats")
+            assertTrue(fee.feeSats > 0)
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun shouldClaimAStaticDeposit() = liveTest {
+        val mnemonic = requireStaticDepositWallet()
+        val txId = TestConfig.staticDepositTxid
+        assumeTrue("SPARK_TEST_STATIC_DEPOSIT_TXID is not set", txId != null)
+        withWallet(mnemonic, account = TestConfig.staticDepositAccount) { wallet ->
+            // A deposit can be claimed once: after that the SSP answers "Transaction not found." for
+            // it. Skip only when the operators report this one claimed.
+            val address = wallet.getStaticDepositAddress().address
+            val isDeposit = { utxo: DepositUtxo -> utxo.txid.equals(txId!!, ignoreCase = true) }
+            val alreadyClaimed = wallet.getUtxosForDepositAddress(address = address).none(isDeposit) &&
+                wallet.getUtxosForDepositAddress(address = address, excludeClaimed = false).any(isDeposit)
+            assumeTrue(
+                "the configured deposit $txId is already claimed; set SPARK_TEST_STATIC_DEPOSIT_TXID to an unclaimed one",
+                !alreadyClaimed,
+            )
+
+            val before = wallet.getBalance().satsBalance.available
+            println("Balance before claim: $before sats")
+            val quote = wallet.getDepositFeeEstimate(transactionId = txId!!, outputIndex = 0u)
+            val transferId = wallet.claimStaticDeposit(transactionId = txId, outputIndex = 0u, quote = quote)
+            println("Claim transfer ID: $transferId")
+            delay(3_000)
+            wallet.claimAllPendingTransfers()
+            val after = wallet.getBalance().satsBalance.available
+            println("Balance after claim: $after sats")
+            assertTrue(after > before)
+        }
+    }
+}
+
+// =============================================================================
+// Settings Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class SettingsTests : LiveSuite() {
+    @Test
+    fun shouldTogglePrivacyMode() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            println("Privacy enabled: ${wallet.getWalletSettings().privateEnabled}")
+            assertTrue(wallet.setPrivacyEnabled(true).privateEnabled)
+            assertTrue(wallet.getWalletSettings().privateEnabled)
+            assertFalse(wallet.setPrivacyEnabled(false).privateEnabled)
+        }
+    }
+}
+
+// =============================================================================
+// Debug / Utility Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class DebugTests : LiveSuite() {
+    @Test
+    fun showAllNodesAndBalances() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val request = Spark.QueryNodesRequest.newBuilder()
+                .setOwnerIdentityPubkey(ByteString.copyFrom(wallet.signer.identityPublicKey))
+                .setNetwork(wallet.config.network.toProto())
+                .build()
+            val nodes = wallet.getCoordinatorStub().queryNodes(request).nodesMap
+            println("=== All Nodes (${nodes.size}) ===")
+            for ((id, node) in nodes) println("  $id: value=${node.value} status=${node.status}")
+            val balance = wallet.getBalance()
+            println("Balance: ${balance.satsBalance.available} sats (${balance.leaves.size} available leaves)")
+        }
+    }
+
+    @Test
+    fun shouldGetTransfers() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val transfers = wallet.getTransfers(limit = 10)
+            val format = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+            println("=== Recent Transfers (${transfers.size}) ===")
+            for (t in transfers) {
+                val direction = if (t.senderIdentityPublicKey == wallet.identityPublicKeyHex) "SENT" else "RECV"
+                println("  ${format.format(t.createdAt)} | $direction | ${t.totalValueSats} sats | ${t.status} | ${t.type} | ${t.id}")
+            }
+            assertTrue(transfers.isNotEmpty())
+
+            val first = transfers[0]
+            val single = wallet.getTransfer(id = first.id)
+            assertEquals(first.id, single.id)
+            assertEquals(first.totalValueSats, single.totalValueSats)
+            println("Single transfer lookup OK: ${single.id}")
+        }
+    }
+
+    /**
+     * One `LEDGER` line per test wallet (A, B, and the static-deposit wallet when configured), to
+     * compare before and after a run: every sat the wallets hold is in `owned` or `incoming`.
+     */
+    @Test
+    fun ledgerOfEveryTestWalletsSatsAndTokens() = liveTest {
+        val wallets = mutableListOf("A" to makeWallet(WALLET_A_MNEMONIC), "B" to makeWallet(WALLET_B_MNEMONIC))
+        TestConfig.staticDepositMnemonic?.let { wallets.add("static" to makeWallet(it, account = TestConfig.staticDepositAccount)) }
+        var total = 0L
+        for ((name, wallet) in wallets) {
+            try {
+                val balance = wallet.getBalance()
+                val sats = balance.satsBalance
+                val tokens = balance.tokenBalances.map { "${it.tokenMetadata.tokenTicker}=${it.ownedBalance}" }.sorted().joinToString(",")
+                println(
+                    "LEDGER $name owned=${sats.owned} available=${sats.available} incoming=${sats.incoming} " +
+                        "frozen=${sats.frozen} leaves=${balance.leaves.size} tokens=[$tokens]",
+                )
+                total += sats.owned + sats.incoming
+            } finally {
+                wallet.close()
+            }
+        }
+        println("LEDGER total owned+incoming=$total")
+    }
+
+    @Test
+    fun showWalletInfo() = liveTest {
+        withWallets { walletA, walletB ->
+            for ((name, wallet) in listOf("A" to walletA, "B" to walletB)) {
+                val balance = wallet.getBalance()
+                println("=== Wallet $name ===")
+                println("  Identity: ${wallet.identityPublicKeyHex}")
+                println("  Spark:    ${wallet.getSparkAddress()}")
+                println("  Balance:  ${balance.satsBalance.available} sats (${balance.leaves.size} leaves)")
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Funding Helpers (run manually)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class FundingTests : LiveSuite() {
+    @Test
+    fun createALightningInvoiceToFundWalletA() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val invoice = wallet.createLightningInvoice(amountSats = 2000, memo = "Fund walletA for tests")
+            println("\n=== PAY THIS INVOICE TO FUND WALLET A ===")
+            println(invoice.paymentRequest)
+            println("==========================================")
+            println("Amount: 2000 sats | Hash: ${invoice.paymentHash}")
+        }
+    }
+
+    @Test
+    fun claimAllPendingTransfersForWalletA() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val claimed = wallet.claimAllPendingTransfers()
+            println("Claimed $claimed transfers. Balance: ${wallet.getBalance().satsBalance.available} sats")
+        }
+    }
+
+    /** Kotlin-only: waits up to two minutes for someone to pay a 100-sat invoice. */
+    @Ignore("Manual: waits for an external payment")
+    @Test(timeout = 5 * MINUTE)
+    fun receiveAPayment() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val before = wallet.getBalance().satsBalance.owned
+            val invoice = wallet.createLightningInvoice(amountSats = 100, memo = "pay me 100 sats")
+            println("\n=== PAY THIS INVOICE (100 sats) ===\n${invoice.paymentRequest}\n===================================")
+            val paid = eventually(kotlin.time.Duration.parse("2m")) { wallet.claimAllPendingTransfers() > 0 }
+            val after = wallet.getBalance().satsBalance.owned
+            println(if (paid) "Payment received: +${after - before} sats" else "Timed out waiting for payment")
+            if (paid) assertTrue(after > before)
+        }
+    }
+}
+
+// =============================================================================
+// Token (BTKN) Integration Tests
+// =============================================================================
+
+/** The tokens [wallet] has issued. */
+private suspend fun issued(wallet: SparkWallet): List<TokenMetadataInfo> = wallet.queryTokenMetadata(issuerPublicKeys = listOf(wallet.signer.identityPublicKey))
+
+/**
+ * Runs [block] on the token issuer and the other test wallet. The Swift suite's wallet A issued
+ * its token; the issuer is whichever test wallet has issued one (wallet A when neither has), so
+ * the suite never issues a second token because the wallets are configured the other way round.
+ */
+private suspend fun <T> withTokenWallets(issuerConfig: SparkConfig = SparkConfig(), block: suspend (issuer: SparkWallet, other: SparkWallet) -> T): T {
+    val issuerIsB = withWallet(WALLET_A_MNEMONIC) { issued(it).isEmpty() } && withWallet(WALLET_B_MNEMONIC) { issued(it).isNotEmpty() }
+    println("token issuer: wallet ${if (issuerIsB) "B" else "A"}")
+    val (issuer, other) = if (issuerIsB) WALLET_B_MNEMONIC to WALLET_A_MNEMONIC else WALLET_A_MNEMONIC to WALLET_B_MNEMONIC
+    return withWallet(issuer, issuerConfig) { issuerWallet -> withWallet(other) { otherWallet -> block(issuerWallet, otherWallet) } }
+}
+
+/** [wallet]'s owned balance of [token], zero when it holds none. */
+private suspend fun tokenBalance(wallet: SparkWallet, token: String): BigInteger =
+    wallet.getTokenBalances().firstOrNull { it.tokenMetadata.tokenIdentifier == token }?.ownedBalance ?: BigInteger.ZERO
+
+/** The operators hold a finalized transaction of [version] under [hash], the hash the SDK reported for it. */
+private suspend fun expectOperatorsKnow(hash: String, wallet: SparkWallet, version: Int = 3) {
+    val request = QueryTokenTransactionsRequest.newBuilder()
+        .setByTxHash(QueryTokenTransactionsByTxHash.newBuilder().addTokenTransactionHashes(ByteString.copyFrom(hash.hexToByteArray())))
+        .build()
+    val found = wallet.getTokenStub().queryTokenTransactions(request).tokenTransactionsWithStatusList
+    assertEquals("the operators hold no transaction $hash", listOf(hash), found.map { it.tokenTransactionHash.toByteArray().toHexString() })
+    assertEquals(TokenTransactionStatus.TOKEN_TRANSACTION_FINALIZED, found.first().status)
+    assertEquals(version, found.first().tokenTransaction.version)
+}
+
+@RunWith(AndroidJUnit4::class)
+class TokenIntegrationTests : LiveSuite() {
+    @Test(timeout = 10 * MINUTE)
+    fun shouldCreateATokenMintTransferAToBTransferBToAAndBurn() = liveTest {
+        withTokenWallets { walletA, walletB ->
+            // --- Phase 1: Create Token (or reuse existing) ---
+            val existing = issued(walletA).firstOrNull()
+            val tokenIdentifier = if (existing != null) {
+                println("Reusing existing token: ${existing.tokenName} (${existing.tokenTicker}) ${existing.tokenIdentifier}")
+                existing.tokenIdentifier
+            } else {
+                val creation = walletA.createToken(
+                    tokenName = "KotlinTest",
+                    tokenTicker = "KTST",
+                    decimals = 2u,
+                    maxSupply = BigInteger.valueOf(1_000_000),
+                    isFreezable = false,
+                )
+                assertTrue(creation.transactionHash.isNotEmpty())
+                expectOperatorsKnow(creation.transactionHash, walletA)
+                println("Token created, tx: ${creation.transactionHash}")
+                delay(5_000)
+                val created = issued(walletA).firstOrNull()
+                assertNotNull("Token metadata not found after creation", created)
+                created!!.tokenIdentifier
+            }
+            assertTrue(tokenIdentifier.startsWith("btkn1"))
+
+            // --- Phase 2: Mint Tokens ---
+            val mintAmount = BigInteger.valueOf(10_000)
+            val mintTx = walletA.mintTokens(tokenIdentifier = tokenIdentifier, tokenAmount = mintAmount)
+            assertTrue(mintTx.isNotEmpty())
+            expectOperatorsKnow(mintTx, walletA)
+            println("Mint tx: $mintTx")
+            delay(5_000)
+            assertTrue(tokenBalance(walletA, tokenIdentifier) >= mintAmount)
+
+            // --- Phase 3: Transfer A -> B ---
+            val transferAmount = BigInteger.valueOf(5_000)
+            val transferTx = walletA.transferTokens(
+                tokenIdentifier = tokenIdentifier,
+                tokenAmount = transferAmount,
+                receiverSparkAddress = walletB.getSparkAddress()
+            )
+            assertTrue(transferTx.isNotEmpty())
+            expectOperatorsKnow(transferTx, walletA)
+            println("Transfer A->B tx: $transferTx")
+            delay(5_000)
+            val balanceB = tokenBalance(walletB, tokenIdentifier)
+            println("WalletB token balance: $balanceB")
+            assertTrue(balanceB >= transferAmount)
+
+            // --- Phase 4: Transfer B -> A (send it all back) ---
+            val returnTx = walletB.transferTokens(
+                tokenIdentifier = tokenIdentifier,
+                tokenAmount = transferAmount,
+                receiverSparkAddress = walletA.getSparkAddress()
+            )
+            assertTrue(returnTx.isNotEmpty())
+            expectOperatorsKnow(returnTx, walletB)
+            println("Transfer B->A tx: $returnTx")
+            delay(5_000)
+            // B is back to what it held before the round trip (it may keep tokens from earlier runs).
+            assertEquals(balanceB - transferAmount, tokenBalance(walletB, tokenIdentifier))
+            assertTrue(tokenBalance(walletA, tokenIdentifier) >= mintAmount)
+
+            // --- Phase 5: Burn some tokens ---
+            val burnTx = walletA.burnTokens(tokenIdentifier = tokenIdentifier, tokenAmount = BigInteger.valueOf(1_000))
+            assertTrue(burnTx.isNotEmpty())
+            expectOperatorsKnow(burnTx, walletA)
+            println("Burn tx: $burnTx")
+            delay(5_000)
+            println("WalletA token balance after burn: ${tokenBalance(walletA, tokenIdentifier)}")
+        }
+    }
+
+    @Test(timeout = 10 * MINUTE)
+    fun twoConcurrentSendsFromOneWalletBothLandOnDifferentOutputs() = liveTest {
+        withTokenWallets { walletA, walletB ->
+            val token = issued(walletA).firstOrNull()?.tokenIdentifier
+            assumeTrue("the issuer has issued no token; the lifecycle test creates one", token != null)
+            val rawToken = decodeBech32mTokenIdentifier(token!!, walletA.config.network).first
+            var available = walletA.fetchTokenOutputs(tokenIdentifiers = listOf(rawToken)).filter { TokenOutputLocks.isAvailable(it) }
+            if (available.size < 2) {
+                repeat(2 - available.size) { walletA.mintTokens(tokenIdentifier = token, tokenAmount = BigInteger.TEN) }
+                delay(5_000)
+                available = walletA.fetchTokenOutputs(tokenIdentifiers = listOf(rawToken)).filter { TokenOutputLocks.isAvailable(it) }
+            }
+            // The smallest output's amount: each send then spends a single output, and without locks
+            // both would pick the same one and the operators would refuse one as pre-empted.
+            val amount = available.minOf { decodeUInt128(it.output.tokenAmount) }
+            val before = tokenBalance(walletB, token)
+
+            val addressB = walletB.getSparkAddress()
+            val first = async { walletA.transferTokens(tokenIdentifier = token, tokenAmount = amount, receiverSparkAddress = addressB) }
+            val second = async { walletA.transferTokens(tokenIdentifier = token, tokenAmount = amount, receiverSparkAddress = addressB) }
+            val hashes = listOf(first.await(), second.await())
+            println("Concurrent sends of $amount: $hashes")
+            assertEquals(2, hashes.toSet().size)
+            for (hash in hashes) expectOperatorsKnow(hash, walletA)
+
+            delay(5_000)
+            assertEquals(before + amount * BigInteger.TWO, tokenBalance(walletB, token))
+
+            // Back to A.
+            walletB.transferTokens(tokenIdentifier = token, tokenAmount = amount * BigInteger.TWO, receiverSparkAddress = walletA.getSparkAddress())
+            delay(5_000)
+            assertEquals(before, tokenBalance(walletB, token))
+        }
+    }
+
+    @Test(timeout = 10 * MINUTE)
+    fun aSendRetriedWithItsIdempotencyKeyIsMadeOnceAndReturnsTheSameHash() = liveTest {
+        withTokenWallets { walletA, walletB ->
+            val token = issued(walletA).firstOrNull()?.tokenIdentifier
+            assumeTrue("the issuer has issued no token; the lifecycle test creates one", token != null)
+            val before = tokenBalance(walletB, token!!)
+
+            val key = UUID.randomUUID().toString()
+            val addressB = walletB.getSparkAddress()
+            suspend fun send() =
+                walletA.transferTokens(tokenIdentifier = token, tokenAmount = BigInteger.valueOf(7), receiverSparkAddress = addressB, idempotencyKey = key)
+            val first = send()
+            val retry = send()
+            println("Keyed send: $first, retried: $retry")
+            assertEquals(first, retry)
+            expectOperatorsKnow(first, walletA)
+
+            delay(5_000)
+            assertEquals(before + BigInteger.valueOf(7), tokenBalance(walletB, token))
+
+            // Back to A.
+            walletB.transferTokens(tokenIdentifier = token, tokenAmount = BigInteger.valueOf(7), receiverSparkAddress = walletA.getSparkAddress())
+            delay(5_000)
+            assertEquals(before, tokenBalance(walletB, token))
+        }
+    }
+
+    @Test(timeout = 10 * MINUTE)
+    fun v2TokenTransactionsStillWorkWhenConfigured() = liveTest {
+        withTokenWallets(issuerConfig = SparkConfig(tokenTransactionVersion = TokenTransactionVersion.V2)) { walletA, walletB ->
+            val token = issued(walletA).firstOrNull()?.tokenIdentifier
+            assumeTrue("the issuer has issued no token; the lifecycle test creates one", token != null)
+            val before = tokenBalance(walletB, token!!)
+
+            val hash = walletA.transferTokens(tokenIdentifier = token, tokenAmount = BigInteger.valueOf(3), receiverSparkAddress = walletB.getSparkAddress())
+            println("V2 send: $hash")
+            expectOperatorsKnow(hash, walletA, version = 2)
+            delay(5_000)
+            assertEquals(before + BigInteger.valueOf(3), tokenBalance(walletB, token))
+
+            // Back to A, as V3.
+            walletB.transferTokens(tokenIdentifier = token, tokenAmount = BigInteger.valueOf(3), receiverSparkAddress = walletA.getSparkAddress())
+            delay(5_000)
+            assertEquals(before, tokenBalance(walletB, token))
+        }
+    }
+
+    @Test
+    fun shouldQueryTokenOutputs() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val outputs = wallet.getTokenOutputs()
+            println("Token outputs: ${outputs.size}")
+            for (output in outputs.take(5)) {
+                println("  amount=${output.tokenAmount} token=${output.tokenIdentifier.toHexString().take(16)}... status=${output.status}")
+            }
+        }
+    }
+
+    @Test
+    fun shouldQueryTokenBalances() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val balances = wallet.getTokenBalances()
+            println("Token balances: ${balances.size} tokens")
+            for (balance in balances) {
+                println(
+                    "  ${balance.tokenMetadata.tokenName} (${balance.tokenMetadata.tokenTicker}) ${balance.tokenMetadata.tokenIdentifier}: " +
+                        "owned ${balance.ownedBalance}, available ${balance.availableToSendBalance}, decimals ${balance.tokenMetadata.decimals}",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun shouldQueryTokenMetadataByIssuer() = liveTest {
+        withTokenWallets { issuer, _ ->
+            val metadatas = issued(issuer)
+            println("Token metadata for issuer: ${metadatas.size} tokens")
+            for (meta in metadatas) {
+                println(
+                    "  ${meta.tokenName} (${meta.tokenTicker}) ${meta.tokenIdentifier}: issuer ${meta.issuerPublicKey.toHexString()}, " +
+                        "maxSupply ${decodeUInt128(ByteString.copyFrom(meta.maxSupply))}, freezable ${meta.isFreezable}",
+                )
+                assertEquals(issuer.identityPublicKeyHex, meta.issuerPublicKey.toHexString())
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Idempotency Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class IdempotencyTests : LiveSuite() {
+    @Test(timeout = 5 * MINUTE)
+    fun aTokenTransferWithAnIdempotencyKeyDoesNotDoubleSpend() = liveTest {
+        withTokenWallets { walletA, walletB ->
+            val token = issued(walletA).firstOrNull()?.tokenIdentifier
+            assumeTrue("No token found. Run the token lifecycle test first.", token != null)
+            val before = tokenBalance(walletA, token!!)
+            assumeTrue("Need >= 100 tokens (have $before)", before >= BigInteger.valueOf(100))
+
+            val transferAmount = BigInteger.valueOf(50)
+            val tx = walletA.transferTokens(
+                tokenIdentifier = token,
+                tokenAmount = transferAmount,
+                receiverSparkAddress = walletB.getSparkAddress(),
+                idempotencyKey = "test-idem-token-${UUID.randomUUID()}",
+            )
+            assertTrue(tx.isNotEmpty())
+            println("First transfer tx: $tx")
+            delay(3_000)
+            assertEquals(before - transferAmount, tokenBalance(walletA, token))
+
+            // Send back from B to A to clean up.
+            walletB.transferTokens(tokenIdentifier = token, tokenAmount = transferAmount, receiverSparkAddress = walletA.getSparkAddress())
+            delay(3_000)
+            assertEquals(before, tokenBalance(walletA, token))
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun aLightningPaymentWithAnIdempotencyKeyWorks() = liveTest {
+        withWallets { walletA, walletB ->
+            val before = walletA.getBalance().satsBalance.available
+            needsSats("WalletA", before, 100)
+            val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "idempotency test")
+            val paymentId = walletA.payLightningInvoice(
+                paymentRequest = invoice.paymentRequest,
+                maxFeeSats = 50,
+                idempotencyKey = "test-idem-ln-${UUID.randomUUID()}",
+            )
+            assertTrue(paymentId.isNotEmpty())
+            val after = walletA.getBalance().satsBalance.available
+            println("WalletA balance after: $after sats (was $before)")
+            assertTrue(after < before)
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun aMintWithAnIdempotencyKeyWorks() = liveTest {
+        withTokenWallets { walletA, _ ->
+            val token = issued(walletA).firstOrNull()?.tokenIdentifier
+            assumeTrue("No token found. Run the token lifecycle test first.", token != null)
+            val before = tokenBalance(walletA, token!!)
+            val mintAmount = BigInteger.valueOf(100)
+            val tx = walletA.mintTokens(tokenIdentifier = token, tokenAmount = mintAmount, idempotencyKey = "test-idem-mint-${UUID.randomUUID()}")
+            assertTrue(tx.isNotEmpty())
+            println("Mint tx: $tx")
+            delay(3_000)
+            assertEquals(before + mintAmount, tokenBalance(walletA, token))
+        }
+    }
+}
+
+// =============================================================================
+// Invoice-to-Transfer Matching Tests
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class InvoiceMatchingTests : LiveSuite() {
+    @Test(timeout = 5 * MINUTE)
+    fun aRegularSparkTransferHasNoSparkInvoice() = liveTest {
+        withWallets { walletA, walletB ->
+            needsSats("WalletA", walletA.getBalance().satsBalance.available, 20)
+            // Direct Spark transfer (no invoice).
+            val transfer = walletA.send(receiverIdentityPublicKey = walletB.identityPublicKeyHex.hexToByteArray(), amountSats = 10)
+            println("Direct transfer: ${transfer.id} sparkInvoice=${transfer.sparkInvoice}")
+            assertEquals("Direct Spark transfers should not have a sparkInvoice", null, transfer.sparkInvoice)
+            delay(3_000)
+            assertEquals(null, walletA.getTransfer(id = transfer.id).sparkInvoice)
+            // Claim on B so the transfer completes.
+            walletB.claimAllPendingTransfers()
+        }
+    }
+
+    @Test(timeout = 5 * MINUTE)
+    fun getTransferFromSspMatchesALightningInvoiceToItsTransferByPaymentHash() = liveTest {
+        withWallets { walletA, walletB ->
+            needsSats("WalletA", walletA.getBalance().satsBalance.available, 50)
+            // Step 1: WalletB creates a lightning invoice; WalletA pays it.
+            val invoice = walletB.createLightningInvoice(amountSats = 10, memo = "ssp match test")
+            println("Invoice: ${invoice.paymentRequest.take(40)}... payment hash ${invoice.paymentHash}")
+            val paymentId = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
+            println("Payment ID: $paymentId")
+            delay(5_000)
+            walletB.claimAllPendingTransfers()
+
+            // Step 2: the sender's preimage swap, as the SSP knows it.
+            val preimageSwap = Spark.TransferType.PREIMAGE_SWAP.toString()
+            val sent = walletA.getTransfers(direction = TransferDirection.SENT, limit = 3).firstOrNull { it.type == preimageSwap }
+            assertNotNull("Should find a sent preimage swap transfer", sent)
+            val sentRequest = walletA.getTransferFromSsp(id = sent!!.id)?.userRequest
+            println("Sender SSP request: $sentRequest")
+            if (sentRequest is UserRequest.LightningSend) {
+                assertEquals("SSP send request should reference the original invoice", invoice.paymentRequest, sentRequest.info.encodedInvoice)
+            }
+
+            // Step 3: the receiver's preimage swap, as the SSP knows it.
+            val received = walletB.getTransfers(direction = TransferDirection.RECEIVED, limit = 3).firstOrNull { it.type == preimageSwap }
+            assertNotNull("Should find a received preimage swap transfer", received)
+            val receivedRequest = walletB.getTransferFromSsp(id = received!!.id)?.userRequest
+            println("Receiver SSP request: $receivedRequest")
+            if (receivedRequest is UserRequest.LightningReceive) {
+                // The key match: the payment hash from the SSP is the invoice's.
+                assertEquals(invoice.paymentHash, receivedRequest.info.paymentHash)
+                println("MATCH CONFIRMED: payment_hash from SSP == invoice payment_hash")
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Full Integration Flow (matching JS: end-to-end patterns)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class FullFlowTests : LiveSuite() {
+    @Test(timeout = 10 * MINUTE)
+    fun lightningAToBSparkTransferBToAAndAnExternalLightningPayment() = liveTest {
+        withWallets { walletA, walletB ->
+            val initial = walletA.getBalance().satsBalance.available
+            println("WalletA initial balance: $initial sats")
+            if (initial < MINIMUM_TEST_BALANCE) println("WalletA needs >= $MINIMUM_TEST_BALANCE sats. Deposit to: ${walletA.getDepositAddress().address}")
+            needsSats("WalletA", initial, MINIMUM_TEST_BALANCE)
+
+            // Phase 1: Lightning A -> B.
+            val invoice = walletB.createLightningInvoice(amountSats = 100, memo = "full flow test")
+            assertEquals(100L, invoice.amountSats)
+            val payId = walletA.payLightningInvoice(paymentRequest = invoice.paymentRequest, maxFeeSats = 50)
+            assertTrue(payId.isNotEmpty())
+            println("Payment sent: $payId")
+            delay(5_000)
+            println("WalletB claimed ${walletB.claimAllPendingTransfers()} transfers")
+            val balanceB = walletB.getBalance().satsBalance.available
+            assertTrue(balanceB >= 100)
+
+            // Phase 2: Spark transfer B -> A.
+            val transfer = walletB.send(receiverIdentityPublicKey = walletA.identityPublicKeyHex.hexToByteArray(), amountSats = balanceB)
+            assertTrue(transfer.id.isNotEmpty())
+            delay(3_000)
+            assertTrue(walletA.claimAllPendingTransfers() >= 1)
+            assertEquals(0L, walletB.getBalance().satsBalance.available)
+
+            // Phase 3: external Lightning A -> the configured address.
+            if (TestConfig.lnAddress.isEmpty()) {
+                println("Skipping Phase 3: no Lightning address configured")
+                return@withWallets
+            }
+            val bolt11 = resolveLightningAddress(TestConfig.lnAddress, amountSats = 10)
+            val externalId = walletA.payLightningInvoice(paymentRequest = bolt11, maxFeeSats = 50)
+            assertTrue(externalId.isNotEmpty())
+            val final = walletA.getBalance().satsBalance.available
+            println("Final WalletA balance: $final sats")
+            assertTrue("Should only lose ~15 sats in routing fees, not hundreds", final >= initial - 120)
+        }
+    }
+
+    @Test
+    fun anOnChainWithdrawalFeeEstimate() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val leaves = wallet.getLeaves()
+            println("Balance: ${wallet.getBalance().satsBalance.available} sats, ${leaves.size} leaves")
+            assumeTrue("No leaves — can't estimate fee", leaves.isNotEmpty())
+            val fee = wallet.getWithdrawalFeeEstimate(onChainAddress = "bc1qdxqntgy40ut7ep3mddds98t5undss7ka6l2dud", leafIds = leaves.map { it.id })
+            println("On-chain fee estimate: ${fee.feeSats} sats")
+            assertTrue(fee.feeSats > 0)
+        }
+    }
+}
+
+// =============================================================================
+// Renewal (Kotlin-only)
+// =============================================================================
+
+@RunWith(AndroidJUnit4::class)
+class RenewalTests : LiveSuite() {
+    /** A sweep renews every renewable leaf; the frozen ones (refund timelock below 100) are reported, never renewed. */
+    @Test(timeout = 5 * MINUTE)
+    fun aRenewalSweepLeavesNoRenewableLeafBelowTheThreshold() = liveTest {
+        withWallet(WALLET_A_MNEMONIC) { wallet ->
+            val leaves = wallet.getLeaves()
+            val result = wallet.renewExhaustedLeaves()
+            println("Renewal — checked ${result.checked}, renewed ${result.renewed}, failures ${result.failures}")
+            assertEquals(leaves.size, result.checked)
+            val frozen = leaves.filter { it.isFrozen }.map { it.id }.toSet()
+            assertEquals(frozen, result.failures.map { it.substringBefore(":") }.toSet())
+            for (leaf in wallet.getLeaves().filter { !it.isFrozen }) {
+                assertTrue("leaf ${leaf.id} still below the renewal threshold (${leaf.refundTimelockBlocks})", leaf.refundTimelockBlocks >= RENEWAL_THRESHOLD)
+            }
         }
     }
 }

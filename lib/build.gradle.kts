@@ -61,18 +61,22 @@ version = sdkVersion
 //        spark.test.walletA.mnemonic
 //        spark.test.walletB.mnemonic
 //        spark.test.lnAddress
-//   2. Environment variables:
+//        spark.test.staticDeposit.mnemonic / .account / .address / .txid / .withdrawAddress
+//   2. Environment variables (the Swift SDK's `.env` names):
 //        SPARK_TEST_WALLET_A_MNEMONIC
 //        SPARK_TEST_WALLET_B_MNEMONIC
-//        SPARK_TEST_LN_ADDRESS
+//        SPARK_TEST_LN_ADDRESS (or SPARK_TEST_LIGHTNING_ADDRESS)
+//        SPARK_TEST_STATIC_DEPOSIT_MNEMONIC / _ACCOUNT / _ADDRESS / _TXID / _WITHDRAW_ADDRESS
 //   3. Empty string — integration tests that need the value will skip via
 //      JUnit's `Assume.assumeFalse(value.isEmpty(), ...)`.
 //
-// Nothing read here is ever logged or written to disk.
+// They reach only the instrumented-test APK's own BuildConfig (`gy.pig.spark.test.BuildConfig`,
+// see `androidComponents` below), never the library's, which every AAR built here would carry.
+// Nothing read here is ever logged.
 // -----------------------------------------------------------------------------
 fun loadTestSecret(
     propertyKey: String,
-    envVar: String,
+    vararg envVars: String,
 ): String {
     val localProps = Properties()
     val f = rootProject.file("local.properties")
@@ -80,13 +84,23 @@ fun loadTestSecret(
         f.inputStream().use { localProps.load(it) }
     }
     return localProps.getProperty(propertyKey)
-        ?: System.getenv(envVar)
+        ?: envVars.firstNotNullOfOrNull { System.getenv(it)?.takeIf(String::isNotEmpty) }
         ?: ""
 }
 
-val testWalletAMnemonic = loadTestSecret("spark.test.walletA.mnemonic", "SPARK_TEST_WALLET_A_MNEMONIC")
-val testWalletBMnemonic = loadTestSecret("spark.test.walletB.mnemonic", "SPARK_TEST_WALLET_B_MNEMONIC")
-val testLnAddress = loadTestSecret("spark.test.lnAddress", "SPARK_TEST_LN_ADDRESS")
+val integrationTestSecrets: Map<String, String> =
+    mapOf(
+        "SPARK_TEST_WALLET_A_MNEMONIC" to loadTestSecret("spark.test.walletA.mnemonic", "SPARK_TEST_WALLET_A_MNEMONIC"),
+        "SPARK_TEST_WALLET_B_MNEMONIC" to loadTestSecret("spark.test.walletB.mnemonic", "SPARK_TEST_WALLET_B_MNEMONIC"),
+        "SPARK_TEST_LN_ADDRESS" to loadTestSecret("spark.test.lnAddress", "SPARK_TEST_LN_ADDRESS", "SPARK_TEST_LIGHTNING_ADDRESS"),
+        "SPARK_TEST_STATIC_DEPOSIT_MNEMONIC" to
+            loadTestSecret("spark.test.staticDeposit.mnemonic", "SPARK_TEST_STATIC_DEPOSIT_MNEMONIC"),
+        "SPARK_TEST_STATIC_DEPOSIT_ACCOUNT" to loadTestSecret("spark.test.staticDeposit.account", "SPARK_TEST_STATIC_DEPOSIT_ACCOUNT"),
+        "SPARK_TEST_STATIC_DEPOSIT_ADDRESS" to loadTestSecret("spark.test.staticDeposit.address", "SPARK_TEST_STATIC_DEPOSIT_ADDRESS"),
+        "SPARK_TEST_STATIC_DEPOSIT_TXID" to loadTestSecret("spark.test.staticDeposit.txid", "SPARK_TEST_STATIC_DEPOSIT_TXID"),
+        "SPARK_TEST_STATIC_DEPOSIT_WITHDRAW_ADDRESS" to
+            loadTestSecret("spark.test.staticDeposit.withdrawAddress", "SPARK_TEST_STATIC_DEPOSIT_WITHDRAW_ADDRESS"),
+    )
 
 android {
     namespace = "gy.pig.spark"
@@ -101,14 +115,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
-
-        // Integration-test secrets — injected into `gy.pig.spark.BuildConfig`
-        // for the `androidTest` source set. Empty defaults make CI builds (which
-        // never see real mnemonics) succeed; the tests themselves skip when the
-        // value is empty. Never log these.
-        buildConfigField("String", "SPARK_TEST_WALLET_A_MNEMONIC", "\"$testWalletAMnemonic\"")
-        buildConfigField("String", "SPARK_TEST_WALLET_B_MNEMONIC", "\"$testWalletBMnemonic\"")
-        buildConfigField("String", "SPARK_TEST_LN_ADDRESS", "\"$testLnAddress\"")
     }
 
     buildTypes {
@@ -262,6 +268,22 @@ protobuf {
                     option("lite")
                 }
             }
+        }
+    }
+}
+
+// Integration-test secrets go into the instrumented-test APK's BuildConfig only. Empty values
+// make builds without them (CI) succeed; the tests skip. Never log these.
+androidComponents {
+    onVariants { variant ->
+        val fields = variant.androidTest?.buildConfigFields ?: return@onVariants
+        for ((name, value) in integrationTestSecrets) {
+            val literal = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+            fields.put(
+                name,
+                com.android.build.api.variant
+                    .BuildConfigField("String", literal, null),
+            )
         }
     }
 }

@@ -187,7 +187,7 @@ internal suspend fun SparkWallet.heldLightningSend(transferId: String): Spark.Pr
  * select leaves for amount + fee (swapping if needed), and build the `initiate_preimage_swap_v3`
  * request that hands them to the coordinator as an HTLC transfer to the SSP.
  */
-private suspend fun SparkWallet.prepareLightningSend(payment: LightningPayment, transferId: String): Spark.InitiatePreimageSwapRequest {
+internal suspend fun SparkWallet.prepareLightningSend(payment: LightningPayment, transferId: String): Spark.InitiatePreimageSwapRequest {
     val feeEstimate = getLightningSendFeeEstimate(encodedInvoice = payment.encodedInvoice, amountSats = payment.amountlessInvoiceAmountSats)
     val feeSats = LightningValidator.sendFeeSats(estimate = feeEstimate, maxFeeSats = payment.maxFeeSats)
     // Both are non-negative, so the sum can only overflow past Long.MAX_VALUE.
